@@ -851,6 +851,29 @@ test_setup_native_wizard_rejects_invalid_feature_ids() {
     assert_json_enabled_equals "$config" '[]'
 }
 
+test_setup_native_wizard_rejects_conflicting_feature_ids() {
+    info "Checking setup-native wizard conflicting feature validation"
+    local workspace="$TMP_DIR/setup-native-conflicting-feature"
+    local features_root="$workspace/linux-features"
+    local config="$workspace/features.json"
+    local output_log="$workspace/output.log"
+
+    make_wizard_feature_root "$features_root"
+    printf '%s\n' '{"enabled":[]}' > "$config"
+
+    if CODEX_BOOTSTRAP_NONINTERACTIVE=1 \
+        CODEX_LINUX_FEATURES_ROOT="$features_root" \
+        CODEX_LINUX_FEATURES_CONFIG="$config" \
+        CODEX_LINUX_FEATURES="read-aloud" \
+        CODEX_LINUX_DISABLE_FEATURES="read-aloud" \
+            bash "$REPO_DIR/scripts/bootstrap-wizard.sh" >"$output_log" 2>&1; then
+        fail "setup wizard should reject conflicting feature ids"
+    fi
+
+    assert_contains "$output_log" "Linux feature ids cannot be both enabled and disabled: read-aloud"
+    assert_json_enabled_equals "$config" '[]'
+}
+
 test_setup_native_wizard_disable_is_non_destructive() {
     info "Checking setup-native wizard opt-out guidance is non-destructive"
     local workspace="$TMP_DIR/setup-native-disable-safe"
@@ -872,6 +895,7 @@ JSON
     printf '%s\n' 'cache marker' > "$plugin_cache/marker"
 
     HOME="$fake_home" \
+    XDG_CONFIG_HOME="$fake_home/.config" \
     XDG_DATA_HOME="$fake_home/.local/share" \
     CODEX_BOOTSTRAP_NONINTERACTIVE=1 \
     CODEX_LINUX_FEATURES_ROOT="$features_root" \
@@ -910,6 +934,51 @@ JSON
     assert_contains "$output_log" "Enabled Linux features: remote-mobile-control"
     assert_contains "$output_log" "Default native package mode includes codex-update-manager"
     assert_contains "$output_log" "make install-native"
+}
+
+test_setup_native_wizard_uses_package_name_for_installed_state() {
+    info "Checking setup-native wizard package-name-aware installed state"
+    local workspace="$TMP_DIR/setup-native-package-name"
+    local features_root="$workspace/linux-features"
+    local config="$workspace/features.json"
+    local output_log="$workspace/output.log"
+    local bin_dir="$workspace/bin"
+    local dpkg_args="$workspace/dpkg-query.args"
+
+    make_wizard_feature_root "$features_root"
+    printf '%s\n' '{"enabled":[]}' > "$config"
+    mkdir -p "$bin_dir"
+    cat > "$bin_dir/dpkg-query" <<SCRIPT
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$dpkg_args"
+if [[ "\$*" != *codex-cua-lab* ]]; then
+    exit 1
+fi
+case "\$*" in
+    *"deb "*)
+        printf 'deb 1.2.3'
+        exit 0
+        ;;
+    *)
+        printf '1.2.3'
+        exit 0
+        ;;
+esac
+SCRIPT
+    chmod +x "$bin_dir/dpkg-query"
+
+    PATH="$bin_dir:$PATH" \
+    PACKAGE_NAME="codex-cua-lab" \
+    CODEX_BOOTSTRAP_NONINTERACTIVE=1 \
+    CODEX_LINUX_FEATURES_ROOT="$features_root" \
+    CODEX_LINUX_FEATURES_CONFIG="$config" \
+        bash "$REPO_DIR/scripts/bootstrap-wizard.sh" >"$output_log"
+
+    assert_contains "$output_log" "Installed package: deb 1.2.3"
+    assert_contains "$output_log" "ydotoold.service(system)="
+    assert_contains "$output_log" "ydotoold.service(user)="
+    assert_contains "$dpkg_args" "codex-cua-lab"
+    assert_not_contains "$dpkg_args" "codex-desktop"
 }
 
 test_upstream_build_app_workflow_tracks_dmg_metadata() {
@@ -3895,8 +3964,10 @@ main() {
     test_native_shortcut_targets_compose_existing_flows
     test_setup_native_wizard_noninteractive_feature_writer
     test_setup_native_wizard_rejects_invalid_feature_ids
+    test_setup_native_wizard_rejects_conflicting_feature_ids
     test_setup_native_wizard_disable_is_non_destructive
     test_setup_native_wizard_summary_keeps_existing_config
+    test_setup_native_wizard_uses_package_name_for_installed_state
     test_upstream_build_app_workflow_tracks_dmg_metadata
     test_installer_detects_electron_version_from_plist
     test_installer_keeps_electron_fallback_for_bad_metadata

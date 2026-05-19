@@ -5,6 +5,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FEATURES_ROOT="${CODEX_LINUX_FEATURES_ROOT:-$REPO_DIR/linux-features}"
+PACKAGE_NAME="${PACKAGE_NAME:-codex-desktop}"
 
 info() {
     echo "[setup] $*"
@@ -181,14 +182,20 @@ command_status() {
 
 service_state() {
     local unit="$1"
+    local scope="${2:-system}"
     if ! command -v systemctl >/dev/null 2>&1; then
         printf 'systemctl missing'
         return
     fi
 
     local active enabled
-    active="$(systemctl is-active "$unit" 2>/dev/null || true)"
-    enabled="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    if [ "$scope" = "user" ]; then
+        active="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+        enabled="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
+    else
+        active="$(systemctl is-active "$unit" 2>/dev/null || true)"
+        enabled="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    fi
     if [ -z "$active$enabled" ]; then
         printf 'unknown'
     else
@@ -226,25 +233,25 @@ portal_summary() {
 
 installed_package_version() {
     if command -v dpkg-query >/dev/null 2>&1 &&
-        dpkg-query -W -f='${Version}' codex-desktop >/dev/null 2>&1; then
-        dpkg-query -W -f='deb ${Version}' codex-desktop 2>/dev/null || true
+        dpkg-query -W -f='${Version}' "$PACKAGE_NAME" >/dev/null 2>&1; then
+        dpkg-query -W -f='deb ${Version}' "$PACKAGE_NAME" 2>/dev/null || true
         return
     fi
     if command -v rpm >/dev/null 2>&1 &&
-        rpm -q --qf 'rpm %{VERSION}-%{RELEASE}' codex-desktop >/dev/null 2>&1; then
-        rpm -q --qf 'rpm %{VERSION}-%{RELEASE}' codex-desktop 2>/dev/null || true
+        rpm -q --qf 'rpm %{VERSION}-%{RELEASE}' "$PACKAGE_NAME" >/dev/null 2>&1; then
+        rpm -q --qf 'rpm %{VERSION}-%{RELEASE}' "$PACKAGE_NAME" 2>/dev/null || true
         return
     fi
     if command -v pacman >/dev/null 2>&1 &&
-        pacman -Q codex-desktop >/dev/null 2>&1; then
-        pacman -Q codex-desktop 2>/dev/null | sed 's/^/pacman /'
+        pacman -Q "$PACKAGE_NAME" >/dev/null 2>&1; then
+        pacman -Q "$PACKAGE_NAME" 2>/dev/null | sed 's/^/pacman /'
         return
     fi
     printf 'not installed'
 }
 
 updater_install_summary() {
-    if [ -x /usr/bin/codex-update-manager ] || [ -d /opt/codex-desktop/update-builder ]; then
+    if [ -x /usr/bin/codex-update-manager ] || [ -d "/opt/$PACKAGE_NAME/update-builder" ]; then
         printf 'updater artifacts detected'
     else
         printf 'not detected'
@@ -263,7 +270,7 @@ print_system_summary() {
     info "Native package format: $(detect_package_format)"
     info "Session: XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-unknown} DESKTOP_SESSION=${DESKTOP_SESSION:-unknown} XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-unknown} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-none} DISPLAY=${DISPLAY:-none}"
     info "Helpers: pkexec=$(command_status pkexec) kdialog=$(command_status kdialog) zenity=$(command_status zenity)"
-    info "Computer Use readiness: ydotool=$(command_status ydotool) ydotoold=$(command_status ydotoold) ydotoold.service=[$(service_state ydotoold.service)] ydotool.service=[$(service_state ydotool.service)] socket=$(ydotool_socket_summary) portal=$(portal_summary)"
+    info "Computer Use readiness: ydotool=$(command_status ydotool) ydotoold=$(command_status ydotoold) ydotoold.service(system)=[$(service_state ydotoold.service system)] ydotoold.service(user)=[$(service_state ydotoold.service user)] ydotool.service(system)=[$(service_state ydotool.service system)] ydotool.service(user)=[$(service_state ydotool.service user)] socket=$(ydotool_socket_summary) portal=$(portal_summary)"
     info "Installed package: $(installed_package_version)"
     info "Installed updater mode: $(updater_install_summary)"
 }
@@ -378,6 +385,9 @@ features = discover_features(features_root)
 current = read_enabled_ids(config_path)
 enable = split_ids(enable_raw)
 disable = split_ids(disable_raw)
+conflicting = sorted(set(enable) & set(disable))
+if conflicting:
+    die(f"Linux feature ids cannot be both enabled and disabled: {csv(conflicting)}")
 
 for feature_id in enable:
     if feature_id not in features:
