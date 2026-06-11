@@ -2896,6 +2896,7 @@ test("adds Linux package updater behind the existing app updater manager", () =>
   assert.match(patched, /if\(!this\.options\.enableUpdater&&process\.platform!==`linux`\)/);
   assert.match(patched, /process\.platform===`linux`\?await this\.initializeLinuxPackageUpdater\(\)/);
   assert.match(patched, /async initializeLinuxPackageUpdater\(\)/);
+  assert.match(patched, /this\.updater=\{setAutomaticBackgroundDownloadsEnabled:\(\)=>\{\},checkForUpdates/);
   assert.match(patched, /codexLinuxRunUpdateManager\(\[`check-now`\]\)/);
   assert.match(patched, /codexLinuxRunUpdateManager\(\[`install-ready`\]\)/);
   assert.match(patched, /this\.setInstallProgressPercent\(0\),this\.setUpdateLifecycleState\(`installing`\)/);
