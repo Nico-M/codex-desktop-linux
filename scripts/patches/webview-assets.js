@@ -701,15 +701,29 @@ function applyLinuxAppServerBackfillWaitPatch(currentSource) {
   let changed = false;
 
   if (!patchedSource.includes("function codexLinuxIsStateDbBackfillMessage(")) {
-    const helperAnchors = [
+    // Insert helpers at module top-level so they're visible to ALL scopes.
+    // The helpers must not land inside function fi() (Sentry handler) —
+    // createRequest() calls them from a different scope.
+    const fiAnchor = "function fi(";
+    const legacyAnchors = [
       "function za(e){let t=La.safeParse(e);return t.success?new Ba(t.data):e}",
       "function za(e){",
     ];
-    const helperAnchor = helperAnchors.find((anchor) => patchedSource.includes(anchor));
-    if (helperAnchor != null) {
-      patchedSource = patchedSource.replace(helperAnchor, `${helperSource}${helperAnchor}`);
+    let inserted = false;
+    if (patchedSource.includes(fiAnchor)) {
+      patchedSource = patchedSource.replace(fiAnchor, `${helperSource}${fiAnchor}`);
       changed = true;
-    } else if (shouldPatchTimeout) {
+      inserted = true;
+    }
+    if (!inserted) {
+      const legacyAnchor = legacyAnchors.find((anchor) => patchedSource.includes(anchor));
+      if (legacyAnchor != null) {
+        patchedSource = patchedSource.replace(legacyAnchor, `${helperSource}${legacyAnchor}`);
+        changed = true;
+        inserted = true;
+      }
+    }
+    if (!inserted && shouldPatchTimeout) {
       const timeoutMatch = patchedSource.match(timeoutNeedle);
       const classIndex = timeoutMatch?.index == null
         ? -1
