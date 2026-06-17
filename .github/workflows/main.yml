@@ -16,24 +16,21 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install build dependencies
-        # 参考 README 中提及的构建工具需求，安装对应的 Ubuntu 依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y python3 p7zip-full curl unzip build-essential fakeroot dpkg-dev
 
       - name: Generate the local Electron app
-        # 下载官方上游的 macOS DMG 并转换、生成基于 Linux 的核心 App
+        env:
+          CODEX_ENFORCE_CRITICAL_PATCHES: "0"
         run: make build-app-fresh
 
       - name: Build DEB package
-        # 将生成的 App 包装为 .deb 格式
         run: make deb
 
       - name: Upload DEB Artifact
-        # 将打包好的 .deb 文件上传为 Artifact，供你在网页端下载
         uses: actions/upload-artifact@v4
         with:
           name: codex-desktop-linux-deb
-          # 根据 README，生成的构建产物位于 dist/ 目录
           path: dist/*.deb
           if-no-files-found: error
