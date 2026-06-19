@@ -2349,6 +2349,22 @@ test("uses collision-proof Linux tray icon variables when Electron alias is r", 
   );
 });
 
+test("adds Linux tray icon fallback when current upstream uses small file icon fallback", () => {
+  const iconPathExpression = "process.resourcesPath+`/../content/webview/assets/app-test.png`";
+  const source = trayBundleFixture().replace(
+    "n.app.getFileIcon(process.execPath,{size:process.platform===`win32`?`small`:`normal`})",
+    "n.app.getFileIcon(process.execPath,{size:`small`})",
+  );
+
+  const { value: patched, warnings } = captureWarns(() =>
+    applyPatchTwice(applyLinuxTrayPatch, source, iconPathExpression),
+  );
+
+  assert.deepEqual(warnings, []);
+  assert.match(patched, /__codexLinuxTrayIcon=n\.nativeImage\.createFromPath/);
+  assert.match(patched, /n\.app\.getFileIcon\(process\.execPath,\{size:`small`\}\)/);
+});
+
 test("adds Linux tray support even when About dialog already uses the bundled icon path", () => {
   const iconPathExpression = "process.resourcesPath+`/../content/webview/assets/app-test.png`";
   const packagedTrayIconPathExpression = "process.resourcesPath+`/../.codex-linux/codex-desktop-tray.png`";
@@ -2511,6 +2527,27 @@ test("adds Linux tray support for current minified window and startup identifier
     /catch\(e\)\{O=!1;process\.platform===`linux`&&console\.warn\(`\[codex-linux\] Failed to set up system tray`,e\)\}/,
   );
   assert.equal((patched.match(/\[codex-linux\] Failed to set up system tray/g) ?? []).length, 1);
+});
+
+test("adds Linux tray startup support for current appBrand initializer", () => {
+  const source = [
+    "async function H5(e){let t=await W5(e.appBrand,e.repoRoot),n=new a.Tray(t.defaultIcon);return n}",
+    "let ye=async()=>{O=!0;try{await H5({appBrand:r.et(),repoRoot:j.repoRoot})}catch(e){O=!1,_.reportNonFatal(e instanceof Error?e:`Failed to set up tray`,{kind:`tray-setup-failed`,tags:{errorType:`tray-setup-failed`}}),ee()}};E&&ye();",
+  ].join("");
+
+  const { value: patched, warnings } = captureWarns(() =>
+    applyPatchTwice(applyLinuxTrayPatch, source, null),
+  );
+
+  assert.deepEqual(warnings.filter((warning) => warning.includes("tray startup")), []);
+  assert.match(
+    patched,
+    /\(E\|\|process\.platform===`linux`&&\(typeof codexLinuxIsTrayEnabled!==`function`\|\|codexLinuxIsTrayEnabled\(\)\)\)&&ye\(\);/,
+  );
+  assert.match(
+    patched,
+    /ee\(\);process\.platform===`linux`&&console\.warn\(`\[codex-linux\] Failed to set up system tray`,e\)\}/,
+  );
 });
 
 test("scopes dynamic tray startup matching to the tray initializer", () => {
