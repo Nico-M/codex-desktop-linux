@@ -116,6 +116,16 @@ function hasComputerUseLiteral(source) {
   return /(?:`computer-use`|"computer-use"|'computer-use')/.test(source);
 }
 
+function hasComputerUseNativeAppsMention(source) {
+  return source.includes("native-desktop-apps") &&
+    (
+      hasComputerUseLiteral(source) ||
+      source.includes("computer-use-native-desktop-app-icon") ||
+      source.includes("computerUse.nativeApps") ||
+      source.includes("computerUse.label")
+    );
+}
+
 function isComputerUseNameExpr(nameExpr, computerUseNameVar) {
   return /^(?:`computer-use`|"computer-use"|'computer-use')$/.test(nameExpr) ||
     nameExpr === computerUseNameVar ||
@@ -444,7 +454,7 @@ function applyLinuxComputerUseRendererAvailabilityPatch(currentSource) {
     },
   );
 
-  if (patchedSource.includes("native-desktop-apps") && hasComputerUseLiteral(patchedSource)) {
+  if (hasComputerUseNativeAppsMention(patchedSource)) {
     const nativeAppsPlatformPattern =
       /([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)&&\(([A-Za-z_$][\w$]*)===`macOS`\|\|\3===`windows`\)/g;
     patchedSource = patchedSource.replace(

@@ -5378,6 +5378,24 @@ test("patches all Computer Use renderer availability gates in one pass", () => {
   assert.doesNotMatch(patched, /let _=a&&i&&l&&\(o\|\|m\)/);
 });
 
+test("enables native app mentions on Linux in the current Computer Use picker", () => {
+  const source =
+    "function Iz(e){let t=(0,Lz.c)(9),{enabled:n}=e,{platform:r,isLoading:i}=yt(),a=n&&(r===`macOS`||r===`windows`),o;t[0]===Symbol.for(`react.memo_cache_sentinel`)?(o={order:`usage`},t[0]=o):o=t[0];let s;t[1]===a?s=t[2]:(s={params:o,queryConfig:{enabled:a,staleTime:fe.FIVE_MINUTES,refetchOnWindowFocus:!1}},t[1]=a,t[2]=s);let c=Ce(`native-desktop-apps`,s),l;t[3]!==c||t[4]!==a?(l=a?c.data?.apps??[]:[],t[3]=c,t[4]=a,t[5]=l):l=t[5];let u=i||a&&c.isLoading,d;return t[6]!==l||t[7]!==u?(d={nativeApps:l,isLoading:u},t[6]=l,t[7]=u,t[8]=d):d=t[8],d}" +
+    "function Ope(e){let{platform:u}=yt(),v=l.formatMessage({id:`computerUse.label`,defaultMessage:`Computer use`}),y=n[0]??null,b=[{description:l.formatMessage({id:`computerUse.nativeApps.microsoftExcel.detail`,defaultMessage:`Live workbook control`})}],D;t[4]===r?D=t[5]:(D=e=>({queryKey:ve(`computer-use-native-desktop-app-icon`,{appPath:e.appPath}),queryFn:()=>ie(`computer-use-native-desktop-app-icon`,{params:{appPath:e.appPath}}),enabled:r!=null,staleTime:fe.INFINITE,refetchOnWindowFocus:!1}),t[4]=r,t[5]=D);return v}";
+
+  const patched = applyPatchTwice(applyLinuxComputerUseRendererAvailabilityPatch, source);
+
+  assert.match(patched, /a=n&&\(r===`macOS`\|\|r===`windows`\|\|r===`linux`\)/);
+  assert.doesNotMatch(patched, /a=n&&\(r===`macOS`\|\|r===`windows`\)/);
+});
+
+test("does not enable unrelated native desktop app queries on Linux", () => {
+  const source =
+    "function useNativeApps(e){let{enabled:n}=e,{platform:r,isLoading:i}=yt(),a=n&&(r===`macOS`||r===`windows`),o={params:{order:`usage`},queryConfig:{enabled:a}};return Ce(`native-desktop-apps`,o)}";
+
+  assert.equal(applyLinuxComputerUseRendererAvailabilityPatch(source), source);
+});
+
 test("allows current required-feature Computer Use gate on Linux", () => {
   const source =
     "function Rj(e){return e===`macOS`||e===`windows`}" +
@@ -6159,6 +6177,14 @@ test("patchExtractedApp scans apps bundles for Computer Use availability when UI
         "function p(e){return e===`macOS`||e===`windows`}" +
           "function m(e){let n=(0,f.c)(15),{enabled:r,hostId:i}=e,a=r===void 0?!0:r,{isLoading:o,platform:s}=u(),c=t(i).kind===`local`,d=l(`1506311413`),h;n[0]===i?h=n[1]:(h={featureName:`computer_use`,hostId:i},n[0]=i,n[1]=h);let _=p(h),v;n[2]!==_.enabled||n[3]!==_.isLoading||n[4]!==a||n[5]!==d||n[6]!==c||n[7]!==o||n[8]!==s?(v=g({enabled:a,isComputerUseFeatureEnabled:_.enabled,isComputerUseFeatureLoading:_.isLoading,isComputerUseGateEnabled:d,isHostCompatiblePlatform:p(s),isHostLocal:c,isPlatformLoading:o,windowType:`electron`}),n[2]=_.enabled,n[3]=_.isLoading,n[4]=a,n[5]=d,n[6]=c,n[7]=o,n[8]=s,n[9]=v):v=n[9];return v}",
       );
+      fs.writeFileSync(
+        path.join(
+          assetsDir,
+          "app-initial~app-main~remote-conversation-page~pull-requests-page~onboarding-page~hotkey-win~current.js",
+        ),
+        "function Iz(e){let t=(0,Lz.c)(9),{enabled:n}=e,{platform:r,isLoading:i}=yt(),a=n&&(r===`macOS`||r===`windows`),o;t[0]===Symbol.for(`react.memo_cache_sentinel`)?(o={order:`usage`},t[0]=o):o=t[0];let s;t[1]===a?s=t[2]:(s={params:o,queryConfig:{enabled:a,staleTime:fe.FIVE_MINUTES,refetchOnWindowFocus:!1}},t[1]=a,t[2]=s);let c=Ce(`native-desktop-apps`,s),l;t[3]!==c||t[4]!==a?(l=a?c.data?.apps??[]:[],t[3]=c,t[4]=a,t[5]=l):l=t[5];let u=i||a&&c.isLoading,d;return t[6]!==l||t[7]!==u?(d={nativeApps:l,isLoading:u},t[6]=l,t[7]=u,t[8]=d):d=t[8],d}" +
+          "function Ope(e){let{platform:u}=yt(),v=l.formatMessage({id:`computerUse.label`,defaultMessage:`Computer use`}),y=n[0]??null,b=[{description:l.formatMessage({id:`computerUse.nativeApps.microsoftExcel.detail`,defaultMessage:`Live workbook control`})}],D;t[4]===r?D=t[5]:(D=e=>({queryKey:ve(`computer-use-native-desktop-app-icon`,{appPath:e.appPath}),queryFn:()=>ie(`computer-use-native-desktop-app-icon`,{params:{appPath:e.appPath}}),enabled:r!=null,staleTime:fe.INFINITE,refetchOnWindowFocus:!1}),t[4]=r,t[5]=D);return v}",
+      );
       fs.writeFileSync(path.join(tempRoot, "package.json"), JSON.stringify({ name: "codex" }));
 
       patchExtractedApp(tempRoot);
@@ -6170,6 +6196,16 @@ test("patchExtractedApp scans apps bundles for Computer Use availability when UI
       assert.match(
         fs.readFileSync(path.join(assetsDir, "use-is-plugins-enabled-current.js"), "utf8"),
         /v=g\(\{enabled:a,isComputerUseFeatureEnabled:s===`linux`\|\|_\.enabled,isComputerUseFeatureLoading:s!==`linux`&&_\.isLoading,isComputerUseGateEnabled:s===`linux`\|\|d,isHostCompatiblePlatform:s===`linux`\|\|p\(s\),isHostLocal:c,isPlatformLoading:o,windowType:`electron`\}\)/,
+      );
+      assert.match(
+        fs.readFileSync(
+          path.join(
+            assetsDir,
+            "app-initial~app-main~remote-conversation-page~pull-requests-page~onboarding-page~hotkey-win~current.js",
+          ),
+          "utf8",
+        ),
+        /a=n&&\(r===`macOS`\|\|r===`windows`\|\|r===`linux`\)/,
       );
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
