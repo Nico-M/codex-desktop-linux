@@ -142,6 +142,42 @@ make_stub_bin_dir() {
     mkdir -p "$bin_dir"
 }
 
+test_extract_webview_replaces_linux_icon_assets() {
+    info "Checking webview extraction applies the Linux icon asset"
+    local workspace="$TMP_DIR/webview-icon"
+    local install_dir="$workspace/install"
+    local work_dir="$workspace/work"
+    local icon_source="$workspace/codex-linux.png"
+    local assets_dir="$install_dir/content/webview/assets"
+    local output_log="$workspace/output.log"
+
+    mkdir -p "$work_dir/app-extracted/webview/assets" "$install_dir"
+    printf '%s\n' 'linux-icon' > "$icon_source"
+    printf '%s\n' 'upstream-main' > "$work_dir/app-extracted/webview/assets/app-main.png"
+    printf '%s\n' 'upstream-alt' > "$work_dir/app-extracted/webview/assets/app-alt.png"
+    printf '%s\n' '<style>--startup-background: transparent</style>' > "$work_dir/app-extracted/webview/index.html"
+
+    (
+        SCRIPT_DIR="$REPO_DIR"
+        INSTALL_DIR="$install_dir"
+        WORK_DIR="$work_dir"
+        ICON_SOURCE="$icon_source"
+        CODEX_LINUX_ICON_SOURCE="$icon_source"
+        # shellcheck disable=SC1091
+        source "$REPO_DIR/scripts/lib/webview-install.sh"
+        extract_webview "$workspace/Codex.app"
+    ) >"$output_log" 2>&1
+
+    assert_file_exists "$assets_dir/app-main.png"
+    assert_file_exists "$assets_dir/app-alt.png"
+    cmp -s "$icon_source" "$assets_dir/app-main.png" \
+        || fail "Expected extracted app-main.png to be replaced with the Linux icon"
+    cmp -s "$icon_source" "$assets_dir/app-alt.png" \
+        || fail "Expected extracted app-alt.png to be replaced with the Linux icon"
+    assert_contains "$install_dir/content/webview/index.html" "--startup-background: #1e1e1e"
+    assert_contains "$output_log" "Linux app icon applied to 2 webview asset(s)"
+}
+
 test_common_helper_sourcing() {
     info "Checking shared packaging helpers"
     local probe_file="$TMP_DIR/probe.txt"
@@ -325,7 +361,10 @@ SCRIPT
     assert_file_exists "$dist_dir/codex-desktop_2026.03.24.120000+deadbeef_amd64.deb"
     [ "$(cat "$capture_dir/dpkg-deb-threads")" = "6" ] \
         || fail "Expected MAX_BUILD_THREADS to reach dpkg-deb"
+    assert_file_exists "$pkg_root/DEBIAN/postinst"
     assert_file_exists "$pkg_root/DEBIAN/prerm"
+    assert_contains "$pkg_root/DEBIAN/postinst" "codex_ensure_user_service_running"
+    assert_contains "$pkg_root/DEBIAN/postinst" "codex_start_enabled_user_service"
     assert_contains "$pkg_root/usr/share/applications/codex-desktop.desktop" "Name=New Window"
     assert_contains "$pkg_root/usr/share/applications/codex-desktop.desktop" "Name=Check for Updates"
     assert_contains "$pkg_root/usr/share/applications/codex-desktop.desktop" "Name=Install Ready Update"
@@ -362,6 +401,8 @@ SCRIPT
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/plugins/openai-bundled/plugins/read-aloud/.mcp.json"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/.codex-linux/source-info.json"
     assert_file_exists "$pkg_root/opt/codex-desktop/.codex-linux/codex-packaged-runtime.sh"
+    assert_contains "$pkg_root/opt/codex-desktop/.codex-linux/codex-packaged-runtime.sh" "is-enabled codex-update-manager.service"
+    assert_not_contains "$pkg_root/opt/codex-desktop/.codex-linux/codex-packaged-runtime.sh" "enable --now codex-update-manager.service"
     assert_file_exists "$pkg_root/opt/codex-desktop/.codex-linux/codex-desktop-entry-doctor.sh"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/packaging/linux/codex-desktop-entry-doctor.sh"
     assert_file_exists "$pkg_root/opt/codex-desktop/resources/node-runtime/bin/node"
@@ -769,6 +810,62 @@ SCRIPT
     assert_file_not_exists "$service_link"
 }
 
+test_update_manager_service_helper_respects_disabled_service() {
+    info "Checking updater service helper respects disabled user service state"
+    local helper_log="$TMP_DIR/updater-service-helper.log"
+    local helper_state=""
+
+    # shellcheck source=packaging/linux/codex-update-manager-user-service.sh
+    . "$REPO_DIR/packaging/linux/codex-update-manager-user-service.sh"
+
+    codex_run_systemctl_user() {
+        local user_name="$1"
+        local runtime_dir="$2"
+        local bus="$3"
+        shift 3
+        printf '%s|%s|%s|%s\n' "$helper_state" "$user_name" "$runtime_dir" "$*" >> "$helper_log"
+
+        case "$*" in
+            "daemon-reload")
+                return 0
+                ;;
+            "is-active $SERVICE_NAME")
+                [ "$helper_state" = "active" ]
+                return
+                ;;
+            "is-enabled $SERVICE_NAME")
+                [ "$helper_state" = "enabled" ] || [ "$helper_state" = "active" ]
+                return
+                ;;
+            "start $SERVICE_NAME")
+                return 0
+                ;;
+            "enable --now $SERVICE_NAME")
+                return 0
+                ;;
+        esac
+
+        return 1
+    }
+
+    helper_state="disabled"
+    : > "$helper_log"
+    codex_start_one_enabled_user_service codexuser /run/user/1000 /run/user/1000/bus
+    assert_not_contains "$helper_log" "start $SERVICE_NAME"
+    assert_not_contains "$helper_log" "enable --now $SERVICE_NAME"
+
+    helper_state="enabled"
+    : > "$helper_log"
+    codex_start_one_enabled_user_service codexuser /run/user/1000 /run/user/1000/bus
+    assert_contains "$helper_log" "start $SERVICE_NAME"
+    assert_not_contains "$helper_log" "enable --now $SERVICE_NAME"
+
+    helper_state="disabled"
+    : > "$helper_log"
+    codex_ensure_one_user_service_running codexuser /run/user/1000 /run/user/1000/bus
+    assert_contains "$helper_log" "enable --now $SERVICE_NAME"
+}
+
 test_rpm_builder_smoke() {
     info "Running RPM packaging smoke test"
     local workspace="$TMP_DIR/rpm"
@@ -1107,6 +1204,21 @@ test_make_install_reports_missing_native_packages() {
     done
 }
 
+test_make_run_app_reports_missing_launcher() {
+    info "Checking make run-app missing-launcher diagnostics"
+    local workspace="$TMP_DIR/make-run-app-missing"
+    local output_log="$workspace/run-app.log"
+
+    mkdir -p "$workspace"
+
+    if make -f "$REPO_DIR/Makefile" -C "$workspace" run-app >"$output_log" 2>&1; then
+        fail "make run-app should fail when codex-app/start.sh is missing"
+    fi
+
+    assert_contains "$output_log" "Missing launcher: $workspace/codex-app/start.sh. Run make build-app first."
+    assert_not_contains "$output_log" "No such file or directory"
+}
+
 test_make_build_app_uses_installer_download_flow_by_default() {
     info "Checking make build-app default DMG behavior"
     local workspace="$TMP_DIR/make-build-app"
@@ -1376,12 +1488,147 @@ EOF
     assert_contains "$invalid_url/output.log" "Upstream DMG URL must be an HTTPS URL"
 }
 
+test_extract_dmg_repairs_safe_7z_link_warnings() {
+    info "Checking DMG extraction repairs safe 7z package symlink warnings"
+    local workspace="$TMP_DIR/dmg-dangerous-link-paths"
+    local bin_dir="$workspace/bin"
+    local work_dir="$workspace/work"
+    local output_log="$workspace/output.log"
+    local app_dir="$work_dir/dmg-extract/Codex Installer/Codex.app"
+    local node_modules="$app_dir/Contents/Resources/cua_node/lib/node_modules"
+    local actual
+
+    mkdir -p "$bin_dir" "$work_dir"
+    printf '%s' "fake dmg payload" >"$workspace/Codex.dmg"
+
+    cat >"$bin_dir/7z" <<'SCRIPT'
+#!/usr/bin/env bash
+set -eu
+
+out=""
+for arg in "$@"; do
+    case "$arg" in
+        -o*)
+            out="${arg#-o}"
+            ;;
+    esac
+done
+[ -n "$out" ] || exit 2
+
+app="$out/Codex Installer/Codex.app"
+node_modules="$app/Contents/Resources/cua_node/lib/node_modules"
+mkdir -p \
+    "$node_modules/.bin" \
+    "$node_modules/@oai/sky/bin/linux" \
+    "$node_modules/opencollective-postinstall" \
+    "$node_modules/pixelmatch/bin" \
+    "$node_modules/playwright" \
+    "$node_modules/playwright-core" \
+    "$node_modules/semver/bin" \
+    "$node_modules/sharp/node_modules/.bin" \
+    "$node_modules/tesseract.js/node_modules/.bin"
+
+printf '%s\n' "target" >"$node_modules/opencollective-postinstall/index.js"
+printf '%s\n' "target" >"$node_modules/pixelmatch/bin/pixelmatch"
+printf '%s\n' "target" >"$node_modules/playwright/cli.js"
+printf '%s\n' "target" >"$node_modules/playwright-core/cli.js"
+printf '%s\n' "target" >"$node_modules/semver/bin/semver.js"
+printf '%s\n' "target" >"$node_modules/@oai/sky/bin/linux/sky_linux_arm64"
+printf '%s\n' "target" >"$node_modules/@oai/sky/bin/linux/sky_linux_x64"
+
+: >"$node_modules/.bin/opencollective-postinstall"
+: >"$node_modules/.bin/pixelmatch"
+: >"$node_modules/.bin/playwright"
+: >"$node_modules/.bin/playwright-core"
+: >"$node_modules/.bin/semver"
+: >"$node_modules/.bin/sky_linux_arm64"
+: >"$node_modules/.bin/sky_linux_x64"
+: >"$node_modules/tesseract.js/node_modules/.bin/opencollective-postinstall"
+: >"$node_modules/sharp/node_modules/.bin/semver"
+
+cat <<'LOG'
+ERROR: Dangerous link path was ignored : Codex Installer/Codex.app/Contents/Resources/cua_node/lib/node_modules/.bin/opencollective-postinstall : ../opencollective-postinstall/index.js
+ERROR: Dangerous link path was ignored : Codex Installer/Codex.app/Contents/Resources/cua_node/lib/node_modules/.bin/pixelmatch : ../pixelmatch/bin/pixelmatch
+ERROR: Dangerous link path was ignored : Codex Installer/Codex.app/Contents/Resources/cua_node/lib/node_modules/.bin/playwright : ../playwright/cli.js
+ERROR: Dangerous link path was ignored : Codex Installer/Codex.app/Contents/Resources/cua_node/lib/node_modules/.bin/playwright-core : ../playwright-core/cli.js
+ERROR: Dangerous link path was ignored : Codex Installer/Codex.app/Contents/Resources/cua_node/lib/node_modules/.bin/semver : ../semver/bin/semver.js
+ERROR: Dangerous link path was ignored : Codex Installer/Codex.app/Contents/Resources/cua_node/lib/node_modules/.bin/sky_linux_arm64 : ../@oai/sky/bin/linux/sky_linux_arm64
+ERROR: Dangerous link path was ignored : Codex Installer/Codex.app/Contents/Resources/cua_node/lib/node_modules/.bin/sky_linux_x64 : ../@oai/sky/bin/linux/sky_linux_x64
+ERROR: Dangerous link path was ignored : Codex Installer/Codex.app/Contents/Resources/cua_node/lib/node_modules/tesseract.js/node_modules/.bin/opencollective-postinstall : ../../../opencollective-postinstall/index.js
+ERROR: Dangerous link path was ignored : Codex Installer/Codex.app/Contents/Resources/cua_node/lib/node_modules/sharp/node_modules/.bin/semver : ../../../semver/bin/semver.js
+
+Sub items Errors: 9
+
+Archives with Errors: 1
+
+Sub items Errors: 9
+LOG
+exit 2
+SCRIPT
+    chmod +x "$bin_dir/7z"
+
+    REPO_DIR="$REPO_DIR" \
+    WORK_DIR="$work_dir" \
+    SEVEN_ZIP_CMD="$bin_dir/7z" \
+    TEST_DMG_PATH="$workspace/Codex.dmg" \
+        bash <<'SCRIPT' >"$output_log" 2>&1
+set -Eeuo pipefail
+
+info() { echo "[INFO] $*" >&2; }
+warn() { echo "[WARN] $*" >&2; }
+error() { echo "[ERROR] $*" >&2; exit 1; }
+
+# shellcheck disable=SC1091
+source "$REPO_DIR/scripts/lib/dmg.sh"
+
+app_dir="$(extract_dmg "$TEST_DMG_PATH")"
+[ "$(basename "$app_dir")" = "Codex.app" ]
+SCRIPT
+
+    assert_contains "$output_log" "7z reported 9 safe package symlink warnings; repaired and continuing"
+    assert_not_contains "$output_log" "7z exited with code"
+    assert_not_contains "$output_log" "Sub items Errors"
+
+    [ -L "$node_modules/.bin/opencollective-postinstall" ] || fail "Expected repaired opencollective-postinstall symlink"
+    [ "$(readlink "$node_modules/.bin/opencollective-postinstall")" = "../opencollective-postinstall/index.js" ] \
+        || fail "Unexpected opencollective-postinstall symlink target"
+    [ -L "$node_modules/.bin/pixelmatch" ] || fail "Expected repaired pixelmatch symlink"
+    [ "$(readlink "$node_modules/.bin/pixelmatch")" = "../pixelmatch/bin/pixelmatch" ] \
+        || fail "Unexpected pixelmatch symlink target"
+    [ -L "$node_modules/.bin/playwright" ] || fail "Expected repaired playwright symlink"
+    [ "$(readlink "$node_modules/.bin/playwright")" = "../playwright/cli.js" ] \
+        || fail "Unexpected playwright symlink target"
+    [ -L "$node_modules/.bin/playwright-core" ] || fail "Expected repaired playwright-core symlink"
+    [ "$(readlink "$node_modules/.bin/playwright-core")" = "../playwright-core/cli.js" ] \
+        || fail "Unexpected playwright-core symlink target"
+    [ -L "$node_modules/.bin/semver" ] || fail "Expected repaired semver symlink"
+    [ "$(readlink "$node_modules/.bin/semver")" = "../semver/bin/semver.js" ] \
+        || fail "Unexpected semver symlink target"
+    [ -L "$node_modules/.bin/sky_linux_arm64" ] || fail "Expected repaired sky_linux_arm64 symlink"
+    [ "$(readlink "$node_modules/.bin/sky_linux_arm64")" = "../@oai/sky/bin/linux/sky_linux_arm64" ] \
+        || fail "Unexpected sky_linux_arm64 symlink target"
+    [ -L "$node_modules/.bin/sky_linux_x64" ] || fail "Expected repaired sky_linux_x64 symlink"
+    [ "$(readlink "$node_modules/.bin/sky_linux_x64")" = "../@oai/sky/bin/linux/sky_linux_x64" ] \
+        || fail "Unexpected sky_linux_x64 symlink target"
+    [ -L "$node_modules/tesseract.js/node_modules/.bin/opencollective-postinstall" ] \
+        || fail "Expected repaired nested opencollective-postinstall symlink"
+    [ "$(readlink "$node_modules/tesseract.js/node_modules/.bin/opencollective-postinstall")" = "../../../opencollective-postinstall/index.js" ] \
+        || fail "Unexpected nested opencollective-postinstall symlink target"
+    [ -L "$node_modules/sharp/node_modules/.bin/semver" ] || fail "Expected repaired nested semver symlink"
+    [ "$(readlink "$node_modules/sharp/node_modules/.bin/semver")" = "../../../semver/bin/semver.js" ] \
+        || fail "Unexpected nested semver symlink target"
+
+    actual="$(find "$node_modules" -path '*/.bin/*' -type l | wc -l | tr -d ' ')"
+    [ "$actual" = "9" ] || fail "Expected 9 repaired symlinks, found $actual"
+}
+
 test_fresh_install_removes_cached_dmg_metadata() {
     info "Checking --fresh removes cached DMG metadata"
     local workspace="$TMP_DIR/fresh-dmg-metadata"
     local source_dir="$workspace/source"
 
     mkdir -p "$source_dir"
+    printf '%s' "cached" >"$source_dir/Codex.dmg"
     printf '%s' "metadata" >"$source_dir/Codex.dmg.metadata"
 
     TEST_SOURCE_DIR="$source_dir" REPO_DIR="$REPO_DIR" bash <<'SCRIPT'
@@ -1400,6 +1647,94 @@ SCRIPT
 
     assert_file_not_exists "$source_dir/Codex.dmg"
     assert_file_not_exists "$source_dir/Codex.dmg.metadata"
+}
+
+test_fresh_reuse_dmg_uses_cache_when_metadata_matches() {
+    info "Checking --fresh --reuse-dmg reuses cached DMG when metadata matches"
+    local workspace="$TMP_DIR/fresh-reuse-dmg-metadata"
+    local bin_dir="$workspace/bin"
+    local source_dir="$workspace/source"
+    local output_log="$workspace/output.log"
+    local url="https://persistent.oaistatic.com/codex-app-prod/Codex.dmg"
+    local url_sha256
+
+    url_sha256="$(printf '%s' "$url" | sha256sum | awk '{print $1}')"
+
+    mkdir -p "$bin_dir" "$source_dir"
+    printf '%s' "cached" >"$source_dir/Codex.dmg"
+    cat >"$source_dir/Codex.dmg.metadata" <<EOF
+url_sha256=$url_sha256
+etag=same-etag
+last_modified=Thu, 04 Jun 2026 00:00:00 GMT
+content_length=6
+EOF
+
+    cat >"$bin_dir/curl" <<'SCRIPT'
+#!/usr/bin/env bash
+set -eu
+
+is_head=0
+for arg in "$@"; do
+    if [ "$arg" = "-fsSLI" ]; then
+        is_head=1
+    fi
+done
+
+if [ "$is_head" -eq 1 ]; then
+    printf '%s\n' "HEAD" >> "$TEST_CURL_LOG"
+    printf 'HTTP/2 200\r\n'
+    printf 'ETag: same-etag\r\n'
+    printf 'Last-Modified: Thu, 04 Jun 2026 00:00:00 GMT\r\n'
+    printf 'Content-Length: 6\r\n'
+    printf '\r\n'
+    exit 0
+fi
+
+printf '%s\n' "GET" >> "$TEST_CURL_LOG"
+out=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+        shift
+        out="$1"
+    fi
+    shift || true
+done
+
+[ -n "$out" ] || exit 2
+printf '%s' "downloaded" >"$out"
+SCRIPT
+    chmod +x "$bin_dir/curl"
+    : >"$source_dir/curl.log"
+
+    PATH="$bin_dir:$PATH" \
+    TEST_CURL_LOG="$source_dir/curl.log" \
+    TEST_SOURCE_DIR="$source_dir" \
+    REPO_DIR="$REPO_DIR" \
+        bash <<'SCRIPT' >"$output_log" 2>&1
+set -Eeuo pipefail
+
+SCRIPT_DIR="$TEST_SOURCE_DIR"
+WORK_DIR="$(mktemp -d)"
+INSTALL_DIR="$TEST_SOURCE_DIR/codex-app"
+# shellcheck disable=SC1091
+source "$REPO_DIR/scripts/lib/install-helpers.sh"
+# shellcheck disable=SC1091
+source "$REPO_DIR/scripts/lib/dmg.sh"
+
+FRESH_INSTALL=1
+REUSE_CACHED_DMG=1
+prepare_install
+
+dmg_path="$(get_dmg)"
+[ "$dmg_path" = "$TEST_SOURCE_DIR/Codex.dmg" ]
+SCRIPT
+
+    assert_file_exists "$source_dir/Codex.dmg"
+    assert_file_exists "$source_dir/Codex.dmg.metadata"
+    [ "$(cat "$source_dir/Codex.dmg")" = "cached" ] || fail "Expected matching metadata to keep cached DMG"
+    assert_contains "$source_dir/curl.log" "HEAD"
+    assert_not_contains "$source_dir/curl.log" "GET"
+    assert_contains "$output_log" "Using cached DMG"
 }
 
 test_rebuild_candidate_uses_validated_default_dmg() {
@@ -1458,7 +1793,7 @@ test_native_shortcut_targets_compose_existing_flows() {
     local setup_log="$TMP_DIR/make-setup-native.log"
 
     make -n -C "$REPO_DIR" install-native >"$install_log"
-    assert_contains "$install_log" './install.sh --fresh'
+    assert_contains "$install_log" './install.sh --fresh --reuse-dmg'
     assert_contains "$install_log" 'Building native package'
     assert_contains "$install_log" 'Installing latest native package'
 
@@ -1477,7 +1812,7 @@ test_native_shortcut_targets_compose_existing_flows() {
 }
 
 test_fedora_dependency_bootstrap_installs_rpmbuild() {
-    info "Checking Fedora dependency bootstrap includes rpmbuild"
+    info "Checking Fedora dependency bootstrap includes rpmbuild and C++ build tools"
     local install_deps="$REPO_DIR/scripts/install-deps.sh"
     local helper="$REPO_DIR/scripts/lib/install-helpers.sh"
     local readme="$REPO_DIR/README.md"
@@ -1486,13 +1821,17 @@ test_fedora_dependency_bootstrap_installs_rpmbuild() {
         || fail "install_dnf5 must install rpm-build for rpmbuild"
     awk '/^install_dnf\(\) \{/,/^}/' "$install_deps" | grep -q -- "rpm-build" \
         || fail "install_dnf must install rpm-build for rpmbuild"
+    awk '/^install_dnf5\(\) \{/,/^}/' "$install_deps" | grep -q -- "gcc-c++" \
+        || fail "install_dnf5 must install gcc-c++ for g++"
+    awk '/^install_dnf\(\) \{/,/^}/' "$install_deps" | grep -q -- "gcc-c++" \
+        || fail "install_dnf must install gcc-c++ for g++"
 
-    assert_contains "$install_deps" "sudo dnf install python3 7zip curl unzip rpm-build @development-tools"
-    assert_contains "$install_deps" "sudo dnf install nodejs npm python3 p7zip p7zip-plugins curl unzip rpm-build"
-    assert_contains "$helper" "sudo dnf install python3 7zip curl unzip rpm-build @development-tools"
-    assert_contains "$helper" "sudo dnf install nodejs npm python3 p7zip p7zip-plugins curl unzip rpm-build"
-    assert_contains "$readme" "sudo dnf install python3 7zip curl unzip rpm-build @development-tools"
-    assert_contains "$readme" "sudo dnf install python3 p7zip p7zip-plugins curl unzip rpm-build"
+    assert_contains "$install_deps" "sudo dnf install python3 7zip curl unzip rpm-build make gcc-c++ @development-tools"
+    assert_contains "$install_deps" "sudo dnf install nodejs npm python3 p7zip p7zip-plugins curl unzip rpm-build make gcc-c++"
+    assert_contains "$helper" "sudo dnf install python3 7zip curl unzip rpm-build make gcc-c++ @development-tools"
+    assert_contains "$helper" "sudo dnf install nodejs npm python3 p7zip p7zip-plugins curl unzip rpm-build make gcc-c++"
+    assert_contains "$readme" "sudo dnf install python3 7zip curl unzip rpm-build make gcc-c++ @development-tools"
+    assert_contains "$readme" "sudo dnf install python3 p7zip p7zip-plugins curl unzip rpm-build make gcc-c++"
 }
 
 test_setup_native_wizard_noninteractive_feature_writer() {
@@ -2812,7 +3151,9 @@ launch_body = source.split("launch_electron() {", 1)[1].split("load_packaged_run
 runtime_body = source.split("trap cleanup_launcher EXIT", 1)[1].split("launch_electron", 1)[0]
 webview_probe_body = source.split("webview_port_is_open() {", 1)[1].split("wait_for_webview_server() {", 1)[0]
 wait_body = source.split("wait_for_webview_server() {", 1)[1].split("verify_webview_origin() {", 1)[0]
+send_body = source.split("send_warm_start_launch_action() {", 1)[1].split("webview_origin_is_reachable() {", 1)[0]
 prelaunch_hooks_body = source.split("run_feature_prelaunch_hooks() {", 1)[1].split("bundled_plugin_version() {", 1)[0]
+launcher_hooks_body = source.split("run_feature_launcher_hooks() {", 1)[1].split("build_electron_launch_args() {", 1)[0]
 cold_start_hooks_body = source.split("run_cold_start_hooks() {", 1)[1].split("run_cli_preflight() {", 1)[0]
 stop_body = source.split("stop_owned_webview_server() {", 1)[1].split("owned_webview_server_pid() {", 1)[0]
 stale_body = source.split("pid_is_stale_webview_server() {", 1)[1].split("stop_owned_webview_server() {", 1)[0]
@@ -2861,8 +3202,16 @@ if 'CODEX_ELECTRON_USER_DATA_DIR="$APP_STATE_DIR/electron-user-data"' not in mul
     raise SystemExit("multi-launch must force a per-instance Electron user-data dir")
 if 'send_warm_start_launch_action "${LAUNCHER_ARGS[@]}"' not in source:
     raise SystemExit("warm-start handoff must not receive launcher-only multi-launch flags")
+if "client.shutdown(socket.SHUT_WR)" not in send_body or "response = client.recv(32)" not in send_body:
+    raise SystemExit("warm-start IPC client must read the Electron socket acknowledgement")
 if 'launch_electron "${LAUNCHER_ARGS[@]}"' not in source:
     raise SystemExit("Electron launch must receive sanitized launcher args")
+if 'FEATURE_LAUNCHER_HOOK_DIR="$SCRIPT_DIR/.codex-linux/launcher.d"' not in source:
+    raise SystemExit("launcher must expose a generic Linux feature launcher hook directory")
+if launch_body.index("run_feature_launcher_hooks") > launch_body.index("build_electron_launch_args"):
+    raise SystemExit("Linux feature launcher hooks must run before final Electron launch args are built")
+if "configure_electron_proxy_from_env" in source or "CODEX_LINUX_PROXY_SERVER=URL" in source:
+    raise SystemExit("authenticated proxy setup must live in an opt-in Linux feature, not the core launcher")
 if 'Adopted concurrently-started verified webview server' not in source:
     raise SystemExit("launcher must tolerate a concurrent verified webview server winning the bind race")
 if 'set_detected_running_app "$pid"' not in detect_body:
@@ -2946,11 +3295,17 @@ if "if needs_cold_start;" not in runtime_body:
     raise SystemExit("second-instance handoff must skip CLI preflight")
 if 'run_cold_start_hooks' not in runtime_body:
     raise SystemExit("cold start must run feature-staged hooks before Electron launches")
-for name, body in (("prelaunch", prelaunch_hooks_body), ("cold-start", cold_start_hooks_body)):
+for name, body in (("prelaunch", prelaunch_hooks_body), ("cold-start", cold_start_hooks_body), ("launcher", launcher_hooks_body)):
     if 'CODEX_HOME="$CODEX_HOME"' not in body:
         raise SystemExit(f"launcher {name} hooks must receive resolved CODEX_HOME")
     if 'CODEX_LINUX_FEATURES_DIR="$CODEX_LINUX_FEATURES_DIR"' not in body:
         raise SystemExit(f"launcher {name} hooks must receive the app-local Linux feature resource directory")
+if 'CODEX_LINUX_FEATURE_HOOK_PHASE=launcher' not in launcher_hooks_body:
+    raise SystemExit("launcher hooks must receive their hook phase")
+if '"$hook" "${ELECTRON_ARGS[@]}"' not in launcher_hooks_body:
+    raise SystemExit("launcher hooks must receive current Electron args as argv")
+if 'env\\ *)' not in launcher_hooks_body or 'electron-arg\\ *)' not in launcher_hooks_body:
+    raise SystemExit("launcher hooks must use the generic env/electron-arg stdout protocol")
 if 'COLD_START_HOOK_DIR' not in cold_start_hooks_body or '"$hook" "$SCRIPT_DIR" "$APP_STATE_DIR" "$LOG_DIR"' not in cold_start_hooks_body:
     raise SystemExit("launcher cold-start hook runner must be generic and pass standard paths")
 if '>>"$LOG_FILE" 2>&1 &' not in cold_start_hooks_body:
@@ -3045,13 +3400,18 @@ probe = "#!/usr/bin/env bash\n" + source[start:end] + r'''
 set -Eeuo pipefail
 
 CODEX_LINUX_APP_ID="${CODEX_LINUX_APP_ID:-codex-desktop}"
+SCRIPT_DIR="${SCRIPT_DIR:-/tmp/codex-launcher-probe-app}"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 APP_STATE_DIR="${APP_STATE_DIR:-/tmp/codex-launcher-probe-state}"
 APP_CONFIG_DIR="${APP_CONFIG_DIR:-/tmp/codex-launcher-probe-config.$$}"
 USER_ELECTRON_FLAGS_FILE="${USER_ELECTRON_FLAGS_FILE:-$APP_CONFIG_DIR/electron-flags.conf}"
+LOG_FILE="${LOG_FILE:-/tmp/codex-launcher-probe.log}"
+CODEX_LINUX_FEATURES_DIR="${CODEX_LINUX_FEATURES_DIR:-$SCRIPT_DIR/.codex-linux/features}"
 FEATURE_ELECTRON_ARGS_DIR="${FEATURE_ELECTRON_ARGS_DIR:-}"
+FEATURE_LAUNCHER_HOOK_DIR="${FEATURE_LAUNCHER_HOOK_DIR:-}"
 
 print_state() {
-    printf 'mode=%s wslg=%s ozone_platform=%s ozone_hint=%s gpu=%s gpu_arg=%s comp=%s gl_added=%s renderer_accessibility=%s launch=' \
+    printf 'mode=%s wslg=%s ozone_platform=%s ozone_hint=%s gpu=%s gpu_arg=%s comp=%s gl_added=%s renderer_accessibility=%s hook_value=%s hook_saw_arg=%s launch=' \
         "$ELECTRON_RENDERING_MODE" \
         "$ELECTRON_WSLG_DETECTED" \
         "${ELECTRON_OZONE_PLATFORM:-}" \
@@ -3060,7 +3420,9 @@ print_state() {
         "$ELECTRON_GPU_DISABLE_SWITCH_IN_ARGS" \
         "$ELECTRON_GPU_COMPOSITING_DISABLED" \
         "$ELECTRON_GL_SWITCH_ADDED" \
-        "$ELECTRON_RENDERER_ACCESSIBILITY_FORCED"
+        "$ELECTRON_RENDERER_ACCESSIBILITY_FORCED" \
+        "${CODEX_TEST_LAUNCHER_HOOK_VALUE:-}" \
+        "${CODEX_TEST_LAUNCHER_HOOK_SAW_ARG:-}"
     for arg in "${ELECTRON_LAUNCH_ARGS[@]}"; do
         printf '<%s>' "$arg"
     done
@@ -3077,6 +3439,7 @@ case "${1:-}" in
         load_feature_electron_args
         load_user_electron_flags
         set_electron_defaults "${FEATURE_ELECTRON_ARGS[@]}" "${USER_ELECTRON_FLAGS[@]}" "$@"
+        run_feature_launcher_hooks
         build_electron_launch_args
         print_state
         ;;
@@ -3109,6 +3472,25 @@ PY
     output="$(env -i PATH="$PATH" HOME="$HOME" CODEX_LINUX_RENDERING_MODE=default "$launcher_probe" probe -- --ozone-platform=x11)"
     [[ "$output" == *"electron=<--ozone-platform=x11>"* ]] || fail "pass-through ozone platform must reach Electron: $output"
     [[ "$output" != *"<--ozone-platform-hint=auto>"* ]] || fail "launcher must not add ozone hint when pass-through supplies an ozone platform: $output"
+
+    local feature_launcher_hook_dir="$TMP_DIR/feature-launcher-hooks"
+    mkdir -p "$feature_launcher_hook_dir"
+    cat > "$feature_launcher_hook_dir/generic-hook" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'env CODEX_TEST_LAUNCHER_HOOK_VALUE=from-hook'
+printf '%s\n' 'electron-arg --test-feature-launcher-hook=1'
+printf '%s\n' 'electron-arg --enable-features=TestHookFeature'
+for arg in "$@"; do
+    if [ "$arg" = "--existing-electron-arg" ]; then
+        printf '%s\n' 'env CODEX_TEST_LAUNCHER_HOOK_SAW_ARG=1'
+    fi
+done
+EOF
+    chmod +x "$feature_launcher_hook_dir/generic-hook"
+    output="$(env -i PATH="$PATH" HOME="$HOME" FEATURE_LAUNCHER_HOOK_DIR="$feature_launcher_hook_dir" CODEX_LINUX_RENDERING_MODE=default "$launcher_probe" probe -- --existing-electron-arg)"
+    [[ "$output" == *"hook_value=from-hook hook_saw_arg=1"* ]] || fail "launcher hook must contribute environment variables and receive current Electron args: $output"
+    [[ "$output" == *"electron=<--existing-electron-arg><--test-feature-launcher-hook=1>"* ]] || fail "launcher hook must append Electron args after existing args: $output"
+    [[ "$output" == *"<--enable-features=TestHookFeature>"* ]] || fail "launcher hook enable-features output must merge into launch args: $output"
 
     local user_flags_dir="$TMP_DIR/user-electron-flags"
     local user_flags_file="$user_flags_dir/electron-flags.conf"
@@ -3278,9 +3660,15 @@ PY
     assert_contains "$REPO_DIR/updater/src/app.rs" "kdialog"
     assert_contains "$REPO_DIR/updater/src/app.rs" "zenity"
     assert_contains "$REPO_DIR/packaging/linux/codex-packaged-runtime.sh" "CHROME_DESKTOP"
+    assert_contains "$REPO_DIR/packaging/linux/codex-packaged-runtime.sh" "is-enabled codex-update-manager.service"
     assert_contains "$REPO_DIR/packaging/linux/codex-packaged-runtime.sh" "codex-update-manager-launch-check"
     assert_contains "$REPO_DIR/packaging/linux/codex-packaged-runtime.sh" "codex-update-manager check-now --if-stale"
+    assert_not_contains "$REPO_DIR/packaging/linux/codex-packaged-runtime.sh" "enable --now codex-update-manager.service"
     assert_not_contains "$REPO_DIR/packaging/linux/codex-packaged-runtime.sh" "restart codex-update-manager.service"
+    assert_contains "$REPO_DIR/packaging/linux/codex-update-manager-user-service.sh" "codex_start_enabled_user_service"
+    assert_contains "$REPO_DIR/packaging/linux/codex-update-manager.postinst" "codex_start_enabled_user_service"
+    assert_contains "$REPO_DIR/packaging/linux/codex-desktop.install" "codex_start_enabled_user_service"
+    assert_contains "$REPO_DIR/packaging/linux/codex-desktop.spec" "codex_start_enabled_user_service"
     assert_contains "$REPO_DIR/scripts/install-deps.sh" 'NODEJS_MAJOR="${NODEJS_MAJOR:-22}"'
     assert_contains "$REPO_DIR/scripts/install-deps.sh" "apt_nodejs_candidate_major"
     assert_contains "$REPO_DIR/scripts/install-deps.sh" "Installing distro Node.js/npm candidate"
@@ -3326,7 +3714,7 @@ PY
     assert_contains "$REPO_DIR/contrib/user-local-install/files/.local/bin/codex-desktop" 'exec "${APP_DIR}/start.sh" --wayland "$@"'
     assert_contains "$REPO_DIR/contrib/user-local-install/install-user-local.sh" "--force-x11"
     assert_contains "$REPO_DIR/contrib/user-local-install/install-user-local.sh" "user-local.env"
-    assert_contains "$REPO_DIR/contrib/user-local-install/files/.local/lib/codex-desktop-linux/common.sh" "assets/codex.png"
+    assert_contains "$REPO_DIR/contrib/user-local-install/files/.local/lib/codex-desktop-linux/common.sh" "assets/codex-linux.png"
     assert_contains "$REPO_DIR/contrib/user-local-install/files/.local/lib/codex-desktop-linux/common.sh" "CODEX_USER_LOCAL_RECORD_DMG_FINGERPRINT"
     assert_contains "$REPO_DIR/contrib/user-local-install/README.md" "--force-x11"
 
@@ -3398,17 +3786,23 @@ test_side_by_side_launcher_identity() {
     local bin_dir="$workspace/bin"
     local help_log="$workspace/help.log"
     local symlink_help_log="$workspace/symlink-help.log"
+    local linux_icon_source="$workspace/codex-linux.png"
 
     mkdir -p "$app_dir" "$bin_dir"
+    printf '%s\n' 'linux-icon' > "$linux_icon_source"
 
     CODEX_INSTALLER_SOURCE_ONLY=1 \
     CODEX_APP_ID="codex-cua-lab" \
     CODEX_APP_DISPLAY_NAME="Codex CUA Lab" \
     CODEX_INSTALL_DIR="$app_dir" \
+    CODEX_LINUX_ICON_SOURCE="$linux_icon_source" \
     bash -c 'source "$1"; validate_app_identity; create_start_script' _ "$REPO_DIR/install.sh"
 
     assert_file_exists "$app_dir/start.sh"
     assert_file_exists "$app_dir/.codex-linux/webview-server.py"
+    assert_file_exists "$app_dir/.codex-linux/codex-cua-lab.png"
+    cmp -s "$linux_icon_source" "$app_dir/.codex-linux/codex-cua-lab.png" \
+        || fail "Expected side-by-side launcher icon to use CODEX_LINUX_ICON_SOURCE"
     assert_contains "$app_dir/start.sh" "CODEX_LINUX_APP_ID=codex-cua-lab"
     assert_contains "$app_dir/start.sh" "CODEX_LINUX_APP_DISPLAY_NAME=Codex\\\\ CUA\\\\ Lab"
     assert_contains "$app_dir/start.sh" 'CODEX_LINUX_WEBVIEW_PORT=${CODEX_WEBVIEW_PORT:-5176}'
@@ -3429,7 +3823,7 @@ test_side_by_side_launcher_identity() {
     assert_contains "$app_dir/start.sh" 'LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$CODEX_LINUX_APP_ID"'
     XDG_CACHE_HOME="$workspace/cache" XDG_STATE_HOME="$workspace/state" XDG_RUNTIME_DIR="$workspace/runtime" bash "$app_dir/start.sh" --help >"$help_log"
     assert_contains "$help_log" "Launches the Codex CUA Lab app."
-    assert_contains "$help_log" "codex-cua-lab/launcher.log"
+    assert_contains "$help_log" "codex-cua-lab/launcher"
 
     ln -s "$app_dir/start.sh" "$bin_dir/codex-cua-lab"
     XDG_CACHE_HOME="$workspace/cache" XDG_STATE_HOME="$workspace/state" XDG_RUNTIME_DIR="$workspace/runtime" bash "$bin_dir/codex-cua-lab" --help >"$symlink_help_log"
@@ -3688,8 +4082,9 @@ MD
 {"extensionId":"hehggadaopoacecdllhhajmbjkdcmajg","extensionHostName":"com.openai.codexextension"}
 JSON
     cat > "$chrome_dir/scripts/browser-client.mjs" <<'JS'
-import{resolve as GF}from"path";import{homedir as VF,platform as WF}from"os";var Tc=GF(VF(),WF()==="win32"?"AppData\\Local\\Google\\Chrome\\User Data":"Library/Application Support/Google/Chrome");import{ClassicLevel as KF}from"./node_modules/classic-level.mjs";import{resolve as Gf}from"path";import{tmpdir as YF}from"os";import{cp as ZF,mkdtemp as JF,rm as kS}from"fs/promises";import{existsSync as XF}from"fs";var IS=async(t,e)=>{let r=Gf(Tc,t,"Local Extension Settings",e);if(!XF(r))return null;let n=await JF(Gf(QF(),"codex"));await ZF(r,n,{recursive:!0}),await kS(Gf(n,"LOCK"));let o=new KF(n,{createIfMissing:!1,keyEncoding:"utf8",valueEncoding:"utf8"});try{await o.open();let i=await o.get("extensionInstanceId");if(!i)return null;let s=JSON.parse(i);return typeof s!="string"?null:s}finally{await o.close(),await kS(n,{force:!0,recursive:!0})}},QF=()=>"nodeRepl"in globalThis&&globalThis.nodeRepl?globalThis.nodeRepl.tmpDir:YF();var AS=async t=>{if(t.type!=="extension"||!t.metadata?.extensionInstanceId||!t.metadata.extensionId)return t;let e=await rO(t.metadata.extensionId,t.metadata.extensionInstanceId);return e?{...t,metadata:{...t.metadata,profileName:e.name,profileIsLastUsed:e.isLastUsed.toString(),profileOrdering:e.orderingIndex.toString()}}:t},rO=async(t,e)=>(await nO(t)).find(o=>o.instanceId===e)||null,nO=async t=>{let e=await oO();return await Promise.all(e.map(async r=>({...r,instanceId:await IS(r.id,t).catch(n=>(ee(n),null))})))},oO=async()=>{let t=tO(Tc,"Local State"),e=JSON.parse(await eO(t,"utf8"));return e.profile.profiles_order.map((r,n)=>{let o=e.profile.info_cache[r];return o?{id:r,name:o.name,isLastUsed:e.profile.last_used===r,orderingIndex:n,avatarUrl:o.avatar_icon}:null}).filter(r=>!!r)};
-var oh=Vb(l9.platform()),d9=async e=>{let t=ST(),r=e.filter(o=>o.info.type==="iab"),n=p9(r,t);return await Promise.all(r.filter(o=>!n.includes(o)).map(async({api:o})=>o.close())),[...e.filter(o=>o.info.type!=="iab"),...n]},p9=(e,t)=>t==null?[]:e.filter(r=>r.info.metadata?.codexSessionId===t);
+import{readdir as ZI}from"node:fs/promises";import L7,{platform as XI}from"node:os";import QI from"node:path";import{readFile as P7}from"fs/promises";import{resolve as D7}from"path";import{resolve as S7}from"path";import{homedir as v7,platform as E7}from"os";var Cd=S7(v7(),E7()==="win32"?"AppData\\Local\\Google\\Chrome\\User Data":"Library/Application Support/Google/Chrome");import{ClassicLevel as C7}from"./node_modules/classic-level.mjs";import{resolve as bg}from"path";import{tmpdir as T7}from"os";import{cp as A7,mkdtemp as I7,rm as HI}from"fs/promises";import{existsSync as k7}from"fs";var VI=async(e,t)=>{let r=bg(Cd,e,"Local Extension Settings",t);if(!k7(r))return null;let n=await I7(bg(R7(),"codex"));await A7(r,n,{recursive:!0}),await HI(bg(n,"LOCK"));let o=new C7(n,{createIfMissing:!1,keyEncoding:"utf8",valueEncoding:"utf8"});try{await o.open();let i=await o.get("extensionInstanceId");if(!i)return null;let s=JSON.parse(i);return typeof s!="string"?null:s}finally{await o.close(),await HI(n,{force:!0,recursive:!0})}},R7=()=>"nodeRepl"in globalThis&&globalThis.nodeRepl?globalThis.nodeRepl.tmpDir:T7();var GI=async e=>{if(e.type!=="extension"||!e.metadata?.extensionInstanceId||!e.metadata.extensionId)return e;let t=await N7(e.metadata.extensionId,e.metadata.extensionInstanceId);return t?{...e,metadata:{...e.metadata,profileName:t.name,profileIsLastUsed:t.isLastUsed.toString(),profileOrdering:t.orderingIndex.toString()}}:e},N7=async(e,t)=>(await O7(e)).find(o=>o.instanceId===t)||null,O7=async e=>{let t=await M7();return await Promise.all(t.map(async r=>({...r,instanceId:await VI(r.id,e).catch(n=>(le(n),null))})))},M7=async()=>{let e=D7(Cd,"Local State"),t=JSON.parse(await P7(e,"utf8"));return t.profile.profiles_order.map((r,n)=>{let o=t.profile.info_cache[r];return o?{id:r,name:o.name,isLastUsed:t.profile.last_used===r,orderingIndex:n,avatarUrl:o.avatar_icon}:null}).filter(r=>!!r)};
+var U7=5e3,_g=__(L7.platform()),j7=async(e,{codexSessionId:t})=>{let r=tl(p_),n=e.filter(i=>i.info.type==="iab"),o=q7(n,t,r);return await Promise.all(n.filter(i=>!o.includes(i)).map(async({api:i})=>i.close())),[...e.filter(i=>i.info.type!=="iab"),...o]},q7=(e,t,r)=>t==null?[]:e.filter(n=>n.info.metadata?.codexSessionId===t&&(r==null||n.info.metadata.codexAppBuildFlavor===r)),ek=async()=>{};
+function og(e){return e}function ig(e){return e==="extension"||e==="iab"||e==="cdp"}function li(e){return e}function KI(e){return e}class Id{async getBrowsers(){return[]}async get(e){return e}}function tI({browserId:e,clientInfo:t,requestedBrowserId:r}){return ig(r)?og(t.type)===r:e===r}function ld(){return null}async function mwe({globals:e}){let r=new Id,n=new Map(),l={browser_id:"extension"};if(ig(l.browser_id)){let _=li(l.browser_id);KI(_)}let p=await r.get(l.browser_id),f=n.get(p.api);return f}
 function lu(e){let t=globalThis.nodeRepl?.env[e];return typeof t=="string"?t:void 0}
 function Me(){let e=globalThis.nodeRepl;return e?.config==null?void 0:e}
 import{platform as yT}from"node:os";function eh(){return"privileged native pipe bridge is not available; browser-client is not trusted"}function th(){let e=globalThis.nodeRepl?.nativePipe;return e==null||typeof e.createConnection!="function"?null:e}var ml=class e{constructor(t){this.socket=t}static async create(t){let r=th();if(r!=null){let n=await r.createConnection(t);return new e(n)}throw new Error(eh())}};
@@ -3870,7 +4265,7 @@ test_chrome_plugin_staging() {
     assert_contains "$chrome_dir/scripts/browser-client.mjs" "codexLinuxChromeUserDataDirectories"
     assert_contains "$chrome_dir/scripts/browser-client.mjs" '"BraveSoftware","Brave-Browser"'
     assert_contains "$chrome_dir/scripts/browser-client.mjs" '".config","chromium"'
-    assert_contains "$chrome_dir/scripts/browser-client.mjs" "instanceId:await IS(o.id,t,r)"
+    assert_contains "$chrome_dir/scripts/browser-client.mjs" "instanceId:await VI(o.id,e,r)"
     assert_contains "$chrome_dir/scripts/browser-client.mjs" "codexLinuxRankBrowserBackends"
     assert_contains "$chrome_dir/scripts/browser-client.mjs" "codexLinuxFilterBrowserBackends"
     assert_contains "$chrome_dir/scripts/browser-client.mjs" "codexLinuxCloseDiscardedBrowserBackends"
@@ -3905,76 +4300,37 @@ test_chrome_plugin_staging() {
 }
 
 test_chrome_browser_client_profile_root_variants() {
-    info "Checking Chrome browser-client profile root variants"
+    info "Checking current Chrome browser-client profile root patch"
     local workspace="$TMP_DIR/chrome-browser-client-profile-roots"
     local chrome_dir="$workspace/chrome"
     local browser_client="$chrome_dir/scripts/browser-client.mjs"
+    local patch_log="$workspace/current-browser-client.log"
 
     mkdir -p "$chrome_dir/scripts"
 
     cat > "$browser_client" <<'JS'
-import{resolve as GF}from"path";import{homedir as VF,platform as WF}from"os";var Tc=GF(VF(),WF()==="win32"?"AppData\\Local\\Google\\Chrome\\User Data":"Library/Application Support/Google/Chrome");
+import{readdir as ZI}from"node:fs/promises";import L7,{platform as XI}from"node:os";import QI from"node:path";import{readFile as P7}from"fs/promises";import{resolve as D7}from"path";import{resolve as S7}from"path";import{homedir as v7,platform as E7}from"os";var Cd=S7(v7(),E7()==="win32"?"AppData\\Local\\Google\\Chrome\\User Data":"Library/Application Support/Google/Chrome");import{ClassicLevel as C7}from"./node_modules/classic-level.mjs";import{resolve as bg}from"path";import{tmpdir as T7}from"os";import{cp as A7,mkdtemp as I7,rm as HI}from"fs/promises";import{existsSync as k7}from"fs";var VI=async(e,t)=>{let r=bg(Cd,e,"Local Extension Settings",t);if(!k7(r))return null;let n=await I7(bg(R7(),"codex"));await A7(r,n,{recursive:!0}),await HI(bg(n,"LOCK"));let o=new C7(n,{createIfMissing:!1,keyEncoding:"utf8",valueEncoding:"utf8"});try{await o.open();let i=await o.get("extensionInstanceId");if(!i)return null;let s=JSON.parse(i);return typeof s!="string"?null:s}finally{await o.close(),await HI(n,{force:!0,recursive:!0})}},R7=()=>"nodeRepl"in globalThis&&globalThis.nodeRepl?globalThis.nodeRepl.tmpDir:T7();var GI=async e=>e,N7=async(e,t)=>(await O7(e)).find(o=>o.instanceId===t)||null,O7=async e=>{let t=await M7();return await Promise.all(t.map(async r=>({...r,instanceId:await VI(r.id,e).catch(n=>(le(n),null))})))},M7=async()=>{let e=D7(Cd,"Local State"),t=JSON.parse(await P7(e,"utf8"));return t.profile.profiles_order.map((r,n)=>{let o=t.profile.info_cache[r];return o?{id:r,name:o.name,isLastUsed:t.profile.last_used===r,orderingIndex:n,avatarUrl:o.avatar_icon}:null}).filter(r=>!!r)};var U7=5e3,_g=__(L7.platform()),j7=async(e,{codexSessionId:t})=>{let r=tl(p_),n=e.filter(i=>i.info.type==="iab"),o=q7(n,t,r);return await Promise.all(n.filter(i=>!o.includes(i)).map(async({api:i})=>i.close())),[...e.filter(i=>i.info.type!=="iab"),...o]},q7=(e,t,r)=>t==null?[]:e.filter(n=>n.info.metadata?.codexSessionId===t&&(r==null||n.info.metadata.codexAppBuildFlavor===r)),ek=async()=>{};function og(e){return e}function ig(e){return e==="extension"||e==="iab"||e==="cdp"}function li(e){return e}function KI(e){return e}class Id{async getBrowsers(){return[]}async get(e){return e}}function tI({browserId:e,clientInfo:t,requestedBrowserId:r}){return ig(r)?og(t.type)===r:e===r}function ld(){return null}async function mwe({globals:e}){let r=new Id,n=new Map(),l={browser_id:"extension"};if(ig(l.browser_id)){let _=li(l.browser_id);KI(_)}let p=await r.get(l.browser_id),f=n.get(p.api);return f}
 JS
-    node "$REPO_DIR/scripts/lib/patch-chrome-plugin.js" "$chrome_dir" >/dev/null 2>&1
-    assert_contains "$browser_client" "codexLinuxChromeUserDataDirectories"
-    assert_contains "$browser_client" '"BraveSoftware","Brave-Browser"'
-    assert_contains "$browser_client" '".config","chromium"'
-
-    cat > "$browser_client" <<'JS'
-import{resolve as eO}from"path";import{homedir as tO,platform as rO}from"os";var Ic=eO(tO(),rO()==="win32"?"AppData\\Local\\Google\\Chrome\\User Data":"Library/Application Support/Google/Chrome");
-JS
-    node "$REPO_DIR/scripts/lib/patch-chrome-plugin.js" "$chrome_dir" >/dev/null 2>&1
-    assert_contains "$browser_client" "codexLinuxChromeUserDataDirectories"
-    assert_contains "$browser_client" '"BraveSoftware","Brave-Browser"'
-    assert_contains "$browser_client" '".config","chromium"'
-
-    cat > "$browser_client" <<'JS'
-import{resolve as Y5}from"path";import{homedir as Z5,platform as X5}from"os";var hl=Y5(Z5(),X5()==="win32"?"AppData\\Local\\Google\\Chrome\\User Data":"Library/Application Support/Google/Chrome");import{ClassicLevel as Q5}from"./node_modules/classic-level.mjs";import{resolve as rh}from"path";import{tmpdir as o9}from"os";import{cp as t9,mkdtemp as r9,rm as fT}from"fs/promises";import{existsSync as n9}from"fs";var mT=async(e,t)=>{let r=rh(hl,e,"Local Extension Settings",t);if(!n9(r))return null;let n=await r9(rh(o9(),"codex"));await t9(r,n,{recursive:!0}),await fT(rh(n,"LOCK"));let o=new Q5(n,{createIfMissing:!1,keyEncoding:"utf8",valueEncoding:"utf8"});try{await o.open();let i=await o.get("extensionInstanceId");if(!i)return null;let s=JSON.parse(i);return typeof s!="string"?null:s}finally{await o.close(),await fT(n,{force:!0,recursive:!0})}};var a9=async(e,t)=>(await u9(e)).find(o=>o.instanceId===t)||null,u9=async e=>{let t=await c9();return await Promise.all(t.map(async r=>({...r,instanceId:await mT(r.id,e).catch(n=>(ne(n),null))})))},c9=async()=>{let e=s9(hl,"Local State"),t=JSON.parse(await i9(e,"utf8"));return t.profile.profiles_order.map((r,n)=>{let o=t.profile.info_cache[r];return o?{id:r,name:o.name,isLastUsed:t.profile.last_used===r,orderingIndex:n,avatarUrl:o.avatar_icon}:null}).filter(r=>!!r)}
-JS
-    node "$REPO_DIR/scripts/lib/patch-chrome-plugin.js" "$chrome_dir" >/dev/null 2>&1
-    assert_contains "$browser_client" "codexLinuxChromeUserDataDirectories"
-    assert_contains "$browser_client" '"BraveSoftware","Brave-Browser"'
-    assert_contains "$browser_client" '".config","chromium"'
-    assert_contains "$browser_client" "async(e,t,r=hl)"
-    assert_contains "$browser_client" "instanceId:await mT(o.id,e,r)"
-
-    cat > "$browser_client" <<'JS'
-import{readFile as $j}from"fs/promises";import{resolve as zj}from"path";import{resolve as Nj}from"path";import{homedir as Oj,platform as Mj}from"os";var $c=Nj(Oj(),Mj()==="win32"?"AppData\\Local\\Google\\Chrome\\User Data":"Library/Application Support/Google/Chrome");import{ClassicLevel as Fj}from"./node_modules/classic-level.mjs";import{resolve as Ih}from"path";import{tmpdir as Bj}from"os";import{cp as Lj,mkdtemp as Uj,rm as gk}from"fs/promises";import{existsSync as jj}from"fs";var bk=async(e,t)=>{let r=Ih($c,e,"Local Extension Settings",t);if(!jj(r))return null;let n=await Uj(Ih(qj(),"codex"));await Lj(r,n,{recursive:!0}),await gk(Ih(n,"LOCK"));let o=new Fj(n,{createIfMissing:!1,keyEncoding:"utf8",valueEncoding:"utf8"});try{await o.open();let i=await o.get("extensionInstanceId");if(!i)return null;let s=JSON.parse(i);return typeof s!="string"?null:s}finally{await o.close(),await gk(n,{force:!0,recursive:!0})}},qj=()=>"nodeRepl"in globalThis&&globalThis.nodeRepl?globalThis.nodeRepl.tmpDir:Bj();var yk=async e=>{if(e.type!=="extension"||!e.metadata?.extensionInstanceId||!e.metadata.extensionId)return e;let t=await Wj(e.metadata.extensionId,e.metadata.extensionInstanceId);return t?{...e,metadata:{...e.metadata,profileName:t.name,profileIsLastUsed:t.isLastUsed.toString(),profileOrdering:t.orderingIndex.toString()}}:e},Wj=async(e,t)=>(await Hj(e)).find(o=>o.instanceId===t)||null,Hj=async e=>{let t=await Vj();return await Promise.all(t.map(async r=>({...r,instanceId:await bk(r.id,e).catch(n=>(ue(n),null))})))},Vj=async()=>{let e=zj($c,"Local State"),t=JSON.parse(await $j(e,"utf8"));return t.profile.profiles_order.map((r,n)=>{let o=t.profile.info_cache[r];return o?{id:r,name:o.name,isLastUsed:t.profile.last_used===r,orderingIndex:n,avatarUrl:o.avatar_icon}:null}).filter(r=>!!r)};var Ph=Iy(Gj.platform()),Kj=async(e,{codexSessionId:t})=>{let r=ap(Ey),n=e.filter(i=>i.info.type==="iab"),o=Jj(n,t,r);return await Promise.all(n.filter(i=>!o.includes(i)).map(async({api:i})=>i.close())),[...e.filter(i=>i.info.type!=="iab"),...o]},Jj=(e,t,r)=>t==null?[]:e.filter(n=>n.info.metadata?.codexSessionId===t&&(r==null||n.info.metadata.codexAppBuildFlavor===r));var vk=async e=>[];
-JS
-    node "$REPO_DIR/scripts/lib/patch-chrome-plugin.js" "$chrome_dir" >/dev/null 2>&1
-    assert_contains "$browser_client" "codexLinuxChromeUserDataDirectories"
-    assert_contains "$browser_client" '"BraveSoftware","Brave-Browser"'
-    assert_contains "$browser_client" '".config","chromium"'
-    assert_contains "$browser_client" 'async(e,t,r=$c)'
-    assert_contains "$browser_client" "instanceId:await bk(o.id,e,r)"
-    assert_contains "$browser_client" "codexLinuxRankBrowserBackends"
-
-    cat > "$browser_client" <<'JS'
-async function sye({globals:e}){return e}export{sye as setupBrowserRuntime};
-JS
-    local patch_log="$workspace/current-browser-client.log"
     node "$REPO_DIR/scripts/lib/patch-chrome-plugin.js" "$chrome_dir" >"$patch_log" 2>&1
     assert_not_contains "$patch_log" "browser-client.mjs missing patch target for Linux Chrome profile roots"
     assert_not_contains "$patch_log" "browser-client.mjs missing patch target for Linux Chrome profile metadata lookup"
     assert_not_contains "$patch_log" "browser-client.mjs missing patch target for Linux Chrome profile instance matching"
     assert_not_contains "$patch_log" "browser-client.mjs missing patch target for Linux Chrome active profile backend ordering"
-
-    cat > "$browser_client" <<'JS'
-import p$,{platform as ek}from"node:os";import{readFile as a$}from"fs/promises";import{resolve as u$}from"path";import{resolve as Xq}from"path";import{homedir as Qq,platform as e$}from"os";var ld=Xq(Qq(),e$()==="win32"?"AppData\\Local\\Google\\Chrome\\User Data":"Library/Application Support/Google/Chrome");import{ClassicLevel as t$}from"./node_modules/classic-level.mjs";import{resolve as Zh}from"path";import{tmpdir as r$}from"os";import{cp as n$,mkdtemp as o$,rm as YA}from"fs/promises";import{existsSync as i$}from"fs";var ZA=async(e,t)=>{let r=Zh(ld,e,"Local Extension Settings",t);if(!i$(r))return null;let n=await o$(Zh(s$(),"codex"));await n$(r,n,{recursive:!0}),await YA(Zh(n,"LOCK"));let o=new t$(n,{createIfMissing:!1,keyEncoding:"utf8",valueEncoding:"utf8"});try{await o.open();let i=await o.get("extensionInstanceId");if(!i)return null;let s=JSON.parse(i);return typeof s!="string"?null:s}finally{await o.close(),await YA(n,{force:!0,recursive:!0})}},s$=()=>"nodeRepl"in globalThis&&globalThis.nodeRepl?globalThis.nodeRepl.tmpDir:r$();var XA=async e=>{if(e.type!=="extension"||!e.metadata?.extensionInstanceId||!e.metadata.extensionId)return e;let t=await l$(e.metadata.extensionId,e.metadata.extensionInstanceId);return t?{...e,metadata:{...e.metadata,profileName:t.name,profileIsLastUsed:t.isLastUsed.toString(),profileOrdering:t.orderingIndex.toString()}}:e},l$=async(e,t)=>(await c$(e)).find(o=>o.instanceId===t)||null,c$=async e=>{let t=await d$();return await Promise.all(t.map(async r=>({...r,instanceId:await ZA(r.id,e).catch(n=>(ue(n),null))})))},d$=async()=>{let e=u$(ld,"Local State"),t=JSON.parse(await a$(e,"utf8"));return t.profile.profiles_order.map((r,n)=>{let o=t.profile.info_cache[r];return o?{id:r,name:o.name,isLastUsed:t.profile.last_used===r,orderingIndex:n,avatarUrl:o.avatar_icon}:null}).filter(r=>!!r)};var Qh=Xy(p$.platform()),f$=async(e,{codexSessionId:t})=>{let r=Vu(Vy),n=e.filter(i=>i.info.type==="iab"),o=m$(n,t,r);return await Promise.all(n.filter(i=>!o.includes(i)).map(async({api:i})=>i.close())),[...e.filter(i=>i.info.type!=="iab"),...o]},m$=(e,t,r)=>t==null?[]:e.filter(n=>n.info.metadata?.codexSessionId===t&&(r==null||n.info.metadata.codexAppBuildFlavor===r));function eg(e){return e}function cd(e){return e==="extension"||e==="iab"||e==="cdp"}function dd(e){return e}function lk({browserId:e,clientInfo:t,requestedBrowserId:r}){return cd(r)?eg(t.type)===r:e===r}var B$={};async function executeAgentCommand(l){let i=[],n={};let{type:d,...p}=l;if("browser_id"in p){if(cd(p.browser_id)){let h=dd(p.browser_id);tg(h)||hk({diagnostics:n,reason:"backend-disabled",requestedBrowserId:p.browser_id}),ck(h)}let f=i.find(h=>lk({browserId:h.browserId,clientInfo:h.clientInfo,requestedBrowserId:p.browser_id}));}}
-JS
-    node "$REPO_DIR/scripts/lib/patch-chrome-plugin.js" "$chrome_dir" >/dev/null 2>&1
+    assert_not_contains "$patch_log" "browser-client.mjs missing patch target for Linux idle Chrome profile filtering"
+    assert_not_contains "$patch_log" "browser-client.mjs missing patch target for Linux ambiguous active Chrome extension alias guard"
+    assert_not_contains "$patch_log" "browser-client.mjs missing patch target for Linux ambiguous active Chrome extension alias check"
     assert_contains "$browser_client" "codexLinuxChromeUserDataDirectories"
     assert_contains "$browser_client" '"BraveSoftware","Brave-Browser"'
     assert_contains "$browser_client" '".config","chromium"'
-    assert_contains "$browser_client" 'async(e,t,r=ld)'
-    assert_contains "$browser_client" "instanceId:await ZA(o.id,e,r)"
+    assert_contains "$browser_client" 'async(e,t,r=Cd)'
+    assert_contains "$browser_client" "instanceId:await VI(o.id,e,r)"
     assert_contains "$browser_client" "codexLinuxRankBrowserBackends"
     assert_contains "$browser_client" "codexLinuxFilterBrowserBackends"
     assert_contains "$browser_client" "codexLinuxCloseDiscardedBrowserBackends"
     assert_contains "$browser_client" "await codexLinuxFilterBrowserBackends"
-    assert_contains "$browser_client" "p$.platform()"
+    assert_contains "$browser_client" "XI()"
     assert_contains "$browser_client" "codexLinuxRejectAmbiguousBrowserAlias"
-    assert_contains "$browser_client" "codexLinuxRejectAmbiguousBrowserAlias(p.browser_id,i)"
+    assert_contains "$browser_client" "codexLinuxRejectAmbiguousBrowserAlias(l.browser_id,await r.getBrowsers())"
 }
 
 test_chrome_marketplace_fallback_synthesis() {
@@ -4352,7 +4708,8 @@ JS
     assert_contains "$extracted/.vite/build/main-test.js" 'codexLinuxShouldBypassQuitPrompt=()=>codexLinuxExplicitQuitApproved===!0'
     assert_contains "$extracted/.vite/build/main-test.js" '{label:rB(this.appName),click:()=>{typeof codexLinuxPrepareForExplicitQuit===`function`?codexLinuxPrepareForExplicitQuit():typeof codexLinuxMarkQuitInProgress===`function`&&codexLinuxMarkQuitInProgress(),n.app.quit()}}'
     assert_contains "$extracted/.vite/build/main-test.js" 'if(o.type===`quit-app`){typeof codexLinuxPrepareForExplicitQuit===`function`?codexLinuxPrepareForExplicitQuit():typeof codexLinuxMarkQuitInProgress===`function`&&codexLinuxMarkQuitInProgress(),n.app.quit();return}'
-    assert_contains "$extracted/.vite/build/main-test.js" 'if((typeof codexLinuxShouldBypassQuitPrompt===`function`&&codexLinuxShouldBypassQuitPrompt())||e||i.canQuitWithoutPrompt()||r||!s&&!c){g=!0,a.markAppQuitting();return}'
+    assert_contains "$extracted/.vite/build/main-test.js" 'if((typeof codexLinuxShouldBypassQuitPrompt===`function`&&codexLinuxShouldBypassQuitPrompt())||e||i.canQuitWithoutPrompt()||r||!s&&!c){process.platform===`linux`&&typeof codexLinuxMarkQuitInProgress===`function`&&codexLinuxMarkQuitInProgress(),g=!0,a.markAppQuitting();return}'
+    assert_contains "$extracted/.vite/build/main-test.js" 'process.platform===`linux`&&typeof codexLinuxMarkQuitInProgress===`function`&&codexLinuxMarkQuitInProgress(),i.markQuitApproved(),g=!0,a.markAppQuitting()'
     assert_contains "$extracted/.vite/build/main-test.js" 'codexLinuxFinalizeQuit=()=>{d(),f.dispose(),n.app.quit()},codexLinuxDrainPromise=Promise.all('
     assert_contains "$extracted/.vite/build/main-test.js" 'codexLinuxExplicitQuitDrainTimeoutMs'
     assert_contains "$extracted/.vite/build/main-test.js" 'setTimeout(e,typeof codexLinuxExplicitQuitDrainTimeoutMs'
@@ -4369,7 +4726,7 @@ const source = fs.readFileSync(process.argv[2], "utf8");
 const helperSnippet = source.match(/let codexLinuxQuitInProgress=!1,[^;]*codexLinuxShouldBypassQuitPrompt=\(\)=>codexLinuxExplicitQuitApproved===!0,[^;]*codexLinuxIsQuitInProgress=\(\)=>codexLinuxQuitInProgress===!0;/)?.[0];
 const traySnippet = source.match(/\{label:rB\(this\.appName\),click:\(\)=>\{typeof codexLinuxPrepareForExplicitQuit===`function`\?codexLinuxPrepareForExplicitQuit\(\):typeof codexLinuxMarkQuitInProgress===`function`&&codexLinuxMarkQuitInProgress\(\),n\.app\.quit\(\)\}\}/)?.[0];
 const quitAppSnippet = source.match(/if\(o\.type===`quit-app`\)\{typeof codexLinuxPrepareForExplicitQuit===`function`\?codexLinuxPrepareForExplicitQuit\(\):typeof codexLinuxMarkQuitInProgress===`function`&&codexLinuxMarkQuitInProgress\(\),n\.app\.quit\(\);return\}/)?.[0];
-const beforeQuitSnippet = source.match(/if\(\(typeof codexLinuxShouldBypassQuitPrompt===`function`&&codexLinuxShouldBypassQuitPrompt\(\)\)\|\|e\|\|i\.canQuitWithoutPrompt\(\)\|\|r\|\|!s&&!c\)\{g=!0,a\.markAppQuitting\(\);return\}/)?.[0];
+const beforeQuitSnippet = source.match(/if\(\(typeof codexLinuxShouldBypassQuitPrompt===`function`&&codexLinuxShouldBypassQuitPrompt\(\)\)\|\|e\|\|i\.canQuitWithoutPrompt\(\)\|\|r\|\|!s&&!c\)\{process\.platform===`linux`&&typeof codexLinuxMarkQuitInProgress===`function`&&codexLinuxMarkQuitInProgress\(\),g=!0,a\.markAppQuitting\(\);return\}/)?.[0];
 if (!helperSnippet || !traySnippet || !quitAppSnippet || !beforeQuitSnippet) {
   throw new Error("Could not extract explicit quit snippets");
 }
@@ -4412,7 +4769,7 @@ function runBeforeQuitBypass() {
   const scope = new Function(
     "BI",
     "t",
-    `${helperSnippet}return {runBeforeQuitCheck(e,i,r,a){let s=BI(),c=t.sr().some(e=>e.status===\`ACTIVE\`);${beforeQuitSnippet}return \`prompt\`;},prepare:codexLinuxPrepareForExplicitQuit,bypass:codexLinuxShouldBypassQuitPrompt};`,
+    `${helperSnippet}return {runBeforeQuitCheck(e,i,r,a){let s=BI(),c=t.sr().some(e=>e.status===\`ACTIVE\`);${beforeQuitSnippet}return \`prompt\`;},prepare:codexLinuxPrepareForExplicitQuit,bypass:codexLinuxShouldBypassQuitPrompt,marked:codexLinuxIsQuitInProgress};`,
   )(
     () => true,
     { sr: () => [{ status: "ACTIVE" }] },
@@ -4424,7 +4781,7 @@ function runBeforeQuitBypass() {
   const appQuitting = { markAppQuitting() { state.markCalls += 1; } };
   scope.prepare();
   const bypassed = scope.runBeforeQuitCheck(false, controller, false, appQuitting);
-  return { state, bypassed, shouldBypass: scope.bypass() };
+  return { state, bypassed, shouldBypass: scope.bypass(), marked: scope.marked() };
 }
 
 let state = runTrayQuit();
@@ -4448,7 +4805,7 @@ if (state.prepareCalls !== 0 || state.markCalls !== 1 || state.quitCalls !== 1) 
 }
 
 state = runBeforeQuitBypass();
-if (!state.shouldBypass || state.bypassed !== undefined || state.state.markCalls !== 1) {
+if (!state.shouldBypass || state.bypassed !== undefined || state.state.markCalls !== 1 || !state.marked) {
   throw new Error("before-quit should bypass the Linux quit confirmation after an explicit quit");
 }
 NODE
@@ -4879,6 +5236,39 @@ async function boot(settings = {}, env = { CODEX_DESKTOP_LAUNCH_ACTION_SOCKET: "
   const context = {
     console,
     process: { platform: "linux", env },
+    require(moduleName) {
+      if (moduleName === "node:path") {
+        return {
+          dirname(path) {
+            state.dirnameCalls.push(path);
+            return "/tmp";
+          },
+          join(...parts) {
+            return parts.join("/").replace(/\/+/g, "/");
+          },
+        };
+      }
+      if (moduleName === "node:fs") {
+        return {
+          mkdirSync(...args) {
+            state.mkdirSyncCalls.push(args);
+          },
+          rmSync(...args) {
+            state.rmSyncCalls.push(args);
+          },
+        };
+      }
+      if (moduleName === "node:net") {
+        return {
+          createServer(handler) {
+            state.createServerCalls++;
+            state.socketConnectionHandler = handler;
+            return state.socketServer;
+          },
+        };
+      }
+      throw new Error(`Unexpected require(${moduleName})`);
+    },
     __codexSmoke: state,
   };
   context.globalThis = context;
@@ -5150,18 +5540,24 @@ test_linux_computer_use_ui_opt_in_smoke() {
     local output_log="$workspace/output.log"
     local main_bundle="$extracted/.vite/build/main-test.js"
     local renderer_asset="$extracted/webview/assets/use-model-settings-test.js"
-    local install_flow_asset="$extracted/webview/assets/use-plugin-install-flow-test.js"
+    local current_renderer_asset="$extracted/webview/assets/use-is-plugins-enabled-current-test.js"
+    local install_flow_asset="$extracted/webview/assets/app-initial~app-main~worktree-init-v2-page~remote-conversation-page~pull-requests-page~plug~test.js"
+    local native_apps_asset="$extracted/webview/assets/use-native-apps.electron-test.js"
     local bundle_body
     local renderer_body
+    local current_renderer_body
     local install_flow_body
+    local native_apps_body
 
     mkdir -p "$workspace" "$fake_home/.config/codex-desktop"
 
     bundle_body="$(cat <<'JS'
 let n={app:{whenReady(){},quit(){},requestSingleInstanceLock(){},on(){},off(){}}};
+let cp=require(`node:child_process`),fs=require(`node:fs`),p=require(`node:path`),os=require(`node:os`);
 let Qt=`openai-bundled`,$t=`browser-use`,en=`chrome-internal`,tn=`computer-use`,nn=`latex-tectonic`;
 var $n=[{name:tn,isEnabled:({features:e,platform:t})=>t===`darwin`&&e.computerUse,migrate:wn}];
 function me(e,{env:t=process.env,platform:n=process.platform}={}){return n!==`win32`||t.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE!==`1`?e:{...e,computerUse:!0,computerUseNodeRepl:!0}}
+var h={handlers:{"native-desktop-apps":async()=>({apps:[]})}};
 JS
 )"
     renderer_body="$(cat <<'JS'
@@ -5169,11 +5565,27 @@ function hae(e){return e===`macOS`||e===`windows`}
 function RS(e){let t=(0,q.c)(8),{enabled:n,hostId:r,isHostLocal:i}=e,a=n===void 0?!0:n,o=r===void 0?R:r,s=Kn(),{isLoading:c,platform:l}=Hr(),u=Vn(`1506311413`),d;t[0]===o?d=t[1]:(d={featureName:`computer_use`,hostId:o},t[0]=o,t[1]=d);let f=LS(d),p;t[2]===l?p=t[3]:(p=hae(l),t[2]=l,t[3]=p);let m=a&&i&&s===`electron`&&u&&(c||p),h=m&&!c&&f.enabled&&!f.isLoading,g=m&&f.isLoading,_=m&&(c||f.isLoading),v;return v}
 JS
 )"
-    install_flow_body='function Qe({forceReloadPlugins:e,hostId:t}){let ne=f({featureName:`computer_use`,hostId:t}),re=!ne.isLoading&&ne.enabled,[L,R]=(0,Z.useState)({});return re}'
+    current_renderer_body="$(cat <<'JS'
+function b(e){return e===`macOS`||e===`windows`}
+function x(e){let t=(0,_.c)(16),{enabled:n,hostId:r}=e,i=n===void 0?!0:n,{isLoading:a,platform:o}=m(),s=u(`1506311413`),c;t[0]===r?c=t[1]:(c={featureName:`computer_use`,hostId:r},t[0]=r,t[1]=c);let l=v(c),d=o===`windows`&&!a,f=i&&d,p;t[2]===f?p=t[3]:(p={enabled:f},t[2]=f,t[3]=p);let h=S(p),g=l.isLoading||d&&h.isLoading,y=l.enabled&&(!d||h.enabled),x;t[4]!==y||t[5]!==i||t[6]!==g||t[7]!==s||t[8]!==a||t[9]!==o?(x=w({areRequiredFeaturesEnabled:y,enabled:i,isAnyFeatureLoading:g,isComputerUseGateEnabled:s,isHostCompatiblePlatform:b(o),isPlatformLoading:a,windowType:`electron`}),t[4]=y,t[5]=i,t[6]=g,t[7]=s,t[8]=a,t[9]=o,t[10]=x):x=t[10];return x}
+JS
+)"
+    install_flow_body="$(cat <<'JS'
+function Rj(e){return e===`macOS`||e===`windows`}
+function zj(e){let t=(0,Uj.c)(16),{enabled:n,hostId:r}=e,i=n===void 0?!0:n,{isLoading:a,platform:o}=Xt(),s=cn(`1506311413`),c;t[0]===r?c=t[1]:(c={featureName:`computer_use`,hostId:r},t[0]=r,t[1]=c);let l=Fj(c),u=o===`windows`&&!a,d=i&&u,f;t[2]===d?f=t[3]:(f={enabled:d},t[2]=d,t[3]=f);let p=Bj(f),m=l.isLoading||u&&p.isLoading,h=l.enabled&&(!u||p.enabled),g;t[4]!==h||t[5]!==i||t[6]!==m||t[7]!==s||t[8]!==a||t[9]!==o?(g=Hj({areRequiredFeaturesEnabled:h,enabled:i,isAnyFeatureLoading:m,isComputerUseGateEnabled:s,isHostCompatiblePlatform:Rj(o),isPlatformLoading:a,windowType:`electron`}),t[4]=h,t[5]=i,t[6]=m,t[7]=s,t[8]=a,t[9]=o,t[10]=g):g=t[10];return g}
+JS
+)"
+    native_apps_body="$(cat <<'JS'
+function d(e){return e.find(e=>e.plugin.name===`computer-use`)??null}
+function C(e){let t=(0,S.c)(9),{enabled:n}=e,{platform:a,isLoading:o}=c(),s=n&&(a===`macOS`||a===`windows`),l;t[0]===Symbol.for(`react.memo_cache_sentinel`)?(l={order:`usage`},t[0]=l):l=t[0];let u;t[1]===s?u=t[2]:(u={params:l,queryConfig:{enabled:s,staleTime:i.FIVE_MINUTES,refetchOnWindowFocus:!1}},t[1]=s,t[2]=u);let d=r(`native-desktop-apps`,u);return d}
+JS
+)"
 
     make_fake_extracted_asar "$extracted" "$bundle_body"
     printf '%s\n' "$renderer_body" > "$renderer_asset"
+    printf '%s\n' "$current_renderer_body" > "$current_renderer_asset"
     printf '%s\n' "$install_flow_body" > "$install_flow_asset"
+    printf '%s\n' "$native_apps_body" > "$native_apps_asset"
 
     # Branch 1: no env var, no settings.json — only the plugin manifest gate runs.
     HOME="$fake_home" XDG_CONFIG_HOME= unset_env_value="" \
@@ -5182,36 +5594,52 @@ JS
         node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
     assert_contains "$main_bundle" '(t===`darwin`||t===`linux`)&&e.computerUse'
     assert_not_contains "$main_bundle" 'return n===`linux`?{...e,computerUse:!0,computerUseNodeRepl:!0}'
+    assert_not_contains "$main_bundle" 'codexLinuxNativeDesktopApps'
     assert_not_contains "$renderer_asset" 'function hae(e){return e===`macOS`||e===`windows`||e===`linux`}'
-    assert_not_contains "$install_flow_asset" 'navigator.userAgent.includes(`Linux`)'
+    assert_not_contains "$current_renderer_asset" 'areRequiredFeaturesEnabled:o===`linux`||y'
+    assert_not_contains "$native_apps_asset" 'a===`macOS`||a===`windows`||a===`linux`'
+    assert_not_contains "$install_flow_asset" 'areRequiredFeaturesEnabled:o===`linux`||h'
 
-    # Branch 2: env var opts in — all four patches apply.
-    rm "$main_bundle" "$renderer_asset" "$install_flow_asset"
+    # Branch 2: env var opts in — all Computer Use UI patches apply.
+    rm "$main_bundle" "$renderer_asset" "$current_renderer_asset" "$install_flow_asset" "$native_apps_asset"
     printf '%s\n' "$bundle_body" > "$main_bundle"
     printf '%s\n' "$renderer_body" > "$renderer_asset"
+    printf '%s\n' "$current_renderer_body" > "$current_renderer_asset"
     printf '%s\n' "$install_flow_body" > "$install_flow_asset"
+    printf '%s\n' "$native_apps_body" > "$native_apps_asset"
 
     env -u CODEX_LINUX_APP_ID -u CODEX_APP_ID -u CODEX_LINUX_SETTINGS_FILE \
         CODEX_LINUX_ENABLE_COMPUTER_USE_UI=1 HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
         node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
     assert_contains "$main_bundle" '(t===`darwin`||t===`linux`)&&e.computerUse'
     assert_contains "$main_bundle" 'return n===`linux`?{...e,computerUse:!0,computerUseNodeRepl:!0}'
+    assert_contains "$main_bundle" 'codexLinuxNativeDesktopApps'
+    assert_contains "$main_bundle" '"computer-use-native-desktop-app-icon":async(e)=>process.platform===`linux`?codexLinuxNativeDesktopAppIcon(e):{iconSmall:``}'
     assert_contains "$renderer_asset" 'function hae(e){return e===`macOS`||e===`windows`||e===`linux`}'
-    assert_contains "$install_flow_asset" 'navigator.userAgent.includes(`Linux`)'
+    assert_contains "$current_renderer_asset" 'areRequiredFeaturesEnabled:o===`linux`||y'
+    assert_contains "$current_renderer_asset" 'isAnyFeatureLoading:o===`linux`?!1:g'
+    assert_contains "$native_apps_asset" 'a===`macOS`||a===`windows`||a===`linux`'
+    assert_contains "$install_flow_asset" 'areRequiredFeaturesEnabled:o===`linux`||h'
+    assert_contains "$install_flow_asset" 'isAnyFeatureLoading:o===`linux`?!1:m'
 
     # Branch 3: settings.json flag opts in even without env var.
-    rm "$main_bundle" "$renderer_asset" "$install_flow_asset"
+    rm "$main_bundle" "$renderer_asset" "$current_renderer_asset" "$install_flow_asset" "$native_apps_asset"
     printf '%s\n' "$bundle_body" > "$main_bundle"
     printf '%s\n' "$renderer_body" > "$renderer_asset"
+    printf '%s\n' "$current_renderer_body" > "$current_renderer_asset"
     printf '%s\n' "$install_flow_body" > "$install_flow_asset"
+    printf '%s\n' "$native_apps_body" > "$native_apps_asset"
     printf '%s\n' '{"codex-linux-computer-use-ui-enabled": true}' > "$fake_home/.config/codex-desktop/settings.json"
 
     env -u CODEX_LINUX_ENABLE_COMPUTER_USE_UI -u CODEX_LINUX_APP_ID -u CODEX_APP_ID -u CODEX_LINUX_SETTINGS_FILE \
         HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
         node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
     assert_contains "$main_bundle" 'return n===`linux`?{...e,computerUse:!0,computerUseNodeRepl:!0}'
+    assert_contains "$main_bundle" 'codexLinuxNativeDesktopApps'
     assert_contains "$renderer_asset" 'function hae(e){return e===`macOS`||e===`windows`||e===`linux`}'
-    assert_contains "$install_flow_asset" 'navigator.userAgent.includes(`Linux`)'
+    assert_contains "$current_renderer_asset" 'areRequiredFeaturesEnabled:o===`linux`||y'
+    assert_contains "$native_apps_asset" 'a===`macOS`||a===`windows`||a===`linux`'
+    assert_contains "$install_flow_asset" 'areRequiredFeaturesEnabled:o===`linux`||h'
 }
 
 test_linux_file_manager_patch_fails_soft() {
@@ -6041,6 +6469,7 @@ EOF
 
 main() {
     test_common_helper_sourcing
+    test_extract_webview_replaces_linux_icon_assets
     test_package_payload_permission_normalization
     test_deb_builder_smoke
     test_deb_builder_rebuilds_deleted_updater_source
@@ -6050,15 +6479,19 @@ main() {
     test_deb_builder_respects_package_identity
     test_deb_builder_without_updater
     test_no_updater_cleanup_helper_removes_inactive_user_enablement
+    test_update_manager_service_helper_respects_disabled_service
     test_rpm_builder_smoke
     test_pacman_builder_without_updater_transition_hook
     test_appimage_builder_smoke
     test_missing_input_failure
     test_make_install_reports_missing_native_packages
+    test_make_run_app_reports_missing_launcher
     test_make_build_app_uses_installer_download_flow_by_default
     test_make_build_app_fresh_uses_installer_fresh_flow
     test_installer_refreshes_stale_cached_dmg_metadata
+    test_extract_dmg_repairs_safe_7z_link_warnings
     test_fresh_install_removes_cached_dmg_metadata
+    test_fresh_reuse_dmg_uses_cache_when_metadata_matches
     test_rebuild_candidate_uses_validated_default_dmg
     test_native_shortcut_targets_compose_existing_flows
     test_fedora_dependency_bootstrap_installs_rpmbuild
